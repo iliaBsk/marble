@@ -1,0 +1,170 @@
+{
+  "user": {
+    "id": "alex",
+    "interests": [
+      {
+        "topic": "ai",
+        "weight": 0.9,
+        "last_boost": "2026-03-22T09:17:21.404Z",
+        "trend": "stable"
+      },
+      {
+        "topic": "shopify",
+        "weight": 0.85,
+        "last_boost": "2026-03-21T09:17:21.408Z",
+        "trend": "rising"
+      },
+      {
+        "topic": "video generation",
+        "weight": 0.8,
+        "last_boost": "2026-03-22T09:17:21.408Z",
+        "trend": "rising"
+      },
+      {
+        "topic": "startups",
+        "weight": 0.75,
+        "last_boost": "2026-03-20T09:17:21.408Z",
+        "trend": "stable"
+      },
+      {
+        "topic": "coaching",
+        "weight": 0.6,
+        "last_boost": "2026-03-18T09:17:21.408Z",
+        "trend": "stable"
+      },
+      {
+        "topic": "crypto",
+        "weight": 0.3,
+        "last_boost": "2026-03-09T09:17:21.408Z",
+        "trend": "falling"
+      },
+      {
+        "topic": "spain",
+        "weight": 0.5,
+        "last_boost": "2026-03-19T09:17:21.408Z",
+        "trend": "stable"
+      },
+      {
+        "topic": "product photography",
+        "weight": 0.7,
+        "last_boost": "2026-03-21T09:17:21.408Z",
+        "trend": "rising"
+      },
+      {
+        "topic": "llm",
+        "weight": 0.85,
+        "last_boost": "2026-03-22T09:17:21.408Z",
+        "trend": "rising"
+      },
+      {
+        "topic": "ecommerce",
+        "weight": 0.7,
+        "last_boost": "2026-03-20T09:17:21.408Z",
+        "trend": "stable"
+      }
+    ],
+    "context": {
+      "active_projects": [
+        "AhaRoll",
+        "SuperstateX",
+        "VIVO",
+        "Prism"
+      ],
+      "calendar": [
+        "Team standup 10:00",
+        "Investor call 14:00",
+        "Gym 18:00"
+      ],
+      "recent_conversations": [
+        "video pipeline GPU",
+        "Shopify app review",
+        "knowledge graph"
+      ],
+      "mood_signal": "high energy"
+    },
+    "history": [
+      {
+        "story_id": "old-1",
+        "reaction": "up",
+        "date": "2026-03-22T09:17:21.408Z",
+        "topics": [
+          "ai",
+          "llm"
+        ],
+        "source": "hackernews"
+      },
+      {
+        "story_id": "old-2",
+        "reaction": "up",
+        "date": "2026-03-22T09:17:21.408Z",
+        "topics": [
+          "shopify",
+          "ecommerce"
+        ],
+        "source": "techcrunch"
+      },
+      {
+        "story_id": "old-3",
+        "reaction": "down",
+        "date": "2026-03-22T09:17:21.408Z",
+        "topics": [
+          "crypto",
+          "nft"
+        ],
+        "source": "coindesk"
+      },
+      {
+        "story_id": "old-4",
+        "reaction": "share",
+        "date": "2026-03-21T09:17:21.408Z",
+        "topics": [
+          "ai",
+          "video generation"
+        ],
+        "source": "arxiv"
+      },
+      {
+        "story_id": "old-5",
+        "reaction": "up",
+        "date": "2026-03-21T09:17:21.408Z",
+        "topics": [
+          "startups",
+          "spain"
+        ],
+        "source": "sifted"
+      },
+      {
+        "story_id": "old-6",
+        "reaction": "skip",
+        "date": "2026-03-20T09:17:21.408Z",
+        "topics": [
+          "politics"
+        ],
+        "source": "bbc"
+      },
+      {
+        "story_id": "old-7",
+        "reaction": "up",
+        "date": "2026-03-20T09:17:21.408Z",
+        "topics": [
+          "coaching",
+          "productivity"
+        ],
+        "source": "substack"
+      }
+    ],
+    "source_trust": {
+      "hackernews": 0.85,
+      "techcrunch": 0.7,
+      "arxiv": 0.9,
+      "substack": 0.65,
+      "sifted": 0.6,
+      "bbc": 0.5,
+      "coindesk": 0.3,
+      "producthunt": 0.75,
+      "reuters": 0.8,
+      "theverge": 0.55
+    }
+  },
+  "updated_at": "2026-03-23T09:17:21.408Z"
+}
