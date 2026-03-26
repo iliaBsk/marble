@@ -1,321 +1,347 @@
 # Marble
 
-![Version](https://img.shields.io/badge/version-0.1.0-blue) ![Node](https://img.shields.io/badge/node-18+-green)
+**Hyper-personalized content curation through person synthesis and simulation.**
 
-**Content scoring and decision compression engine.**
+```javascript
+import { Marble } from 'marble';
+const marble = new Marble();
+const top10 = await marble.select(stories, userContext);  // ranked + explained
+```
 
-Marble implements a user-centric knowledge graph for content ranking and decision prioritization. It combines interest modeling, temporal context, and feedback learning to deliver highly relevant content scoring. Built for content curation, information filtering, and executive decision support systems.
+Marble creates multiple simulated versions of a user, tests them against real-world signals, and learns which version predicts their actual behavior. No thumbs-up buttons needed.
 
----
+## Why Marble?
 
-## Approach
+**Marble is NOT collaborative filtering.** Here's why that matters:
 
-Marble implements a personalization system that differs from collaborative filtering by:
+### Works from User One
+- **Collaborative filtering:** Needs thousands of similar users to make predictions
+- **Marble:** Creates multiple synthetic versions of YOU, tests them against real signals, evolves the best-predicting clone daily
 
-- **Context integration** — considers calendar events, active projects, and recent activity
-- **Temporal scoring** — weights content relevance based on current user context
-- **Semantic matching** — uses embeddings for conceptual similarity detection
-- **User-specific modeling** — builds individual preference models without user-to-user comparison
-- **Feedback loops** — adjusts scoring based on user reactions over time
+### Predicts Business Context, Not Just Preferences
+- **CF:** "Users like you enjoyed this AI article"
+- **Marble:** "This AI safety piece addresses your CTO's concerns for today's 2pm investor meeting"
 
-**Core capabilities:** Advanced content scoring, decision compression, and personalized information filtering.
+### Explains the WHY
+- **CF:** Similarity scores and "people also liked"
+- **Marble:** Hypothesis-driven insights with confidence scores — "Why this matters to your specific goals right now"
 
----
+### Synthesizes Missing Intelligence
+- **CF:** Limited to existing user behavior patterns
+- **Marble:** Generates insights about relationships, timing, and stakeholder concerns you never explicitly provided
+
+### Models Your Network
+- **CF:** Treats you as an isolated individual
+- **Marble:** Understands the people who influence your decisions and tailors recommendations for multi-party dynamics
+
+**The result:** Content that feels like *"How did it know I needed to see this today?"* instead of *"Other people liked this too."*
+
+## Marble vs. The Competition
+
+| Capability | **Marble** | Segment | Amplitude | CF Systems (Netflix, Spotify) |
+|------------|------------|---------|-----------|-------------------------------|
+| **Day-one intelligence** | ✅ Synthetic clones work immediately | ❌ Needs behavior data | ❌ Needs event tracking | ❌ Needs thousands of similar users |
+| **Temporal awareness** | ✅ Calendar, deadlines, project phases | ❌ Static segments | ❌ Historical analysis only | ❌ Time-blind recommendations |
+| **Relationship modeling** | ✅ Stakeholder concerns, decision dynamics | ❌ Individual traits only | ❌ User-level only | ❌ Individual preferences only |
+| **Business outcome focus** | ✅ Optimizes for your KPIs | 🟡 Engagement analytics | 🟡 Product metrics | ❌ Platform engagement only |
+| **Predictive reasoning** | ✅ "Why this will help your meeting" | ❌ Descriptive only | 🟡 What happened | ❌ "People also liked" |
+| **Privacy-first** | ✅ Runs locally, no data upload | ❌ Cloud-dependent | ❌ Cloud-dependent | ❌ Platform data collection |
+
+### What Marble Can Do That CF Cannot
+
+**Scenario 1: Pre-Meeting Intelligence**
+- **CF Result:** "AI articles you might like"
+- **Marble Result:** "AI safety regulatory timeline — addresses your CTO's security concerns for today's 2pm funding call"
+
+**Scenario 2: Stakeholder Alignment**
+- **CF Result:** Recommends based on your past clicks
+- **Marble Result:** Surfaces technical validation stories because it knows your skeptical CTO influences purchasing decisions
+
+**Scenario 3: Project Timing**
+- **CF Result:** Consistent recommendations regardless of context
+- **Marble Result:** Prioritizes launch-relevant content when you're 2 weeks from product release
+
+**Scenario 4: Zero Data Cold Start**
+- **CF Result:** Random popular content until enough behavior accumulates
+- **Marble Result:** Immediate personalization through synthetic clone evolution
+
+## Technical Architecture: Why This Isn't Just Better CF
+
+### CF: Static User-Item Matrix
+```javascript
+// Traditional approach
+const userItemMatrix = {
+  user123: { "article_1": 0.8, "article_2": 0.6 }
+};
+// Predict based on similar users' ratings
+```
+
+### Marble: Dynamic Context-Aware Knowledge Graph
+```javascript
+// Marble approach
+const contextGraph = {
+  interests: { ai: 0.8, startups: 0.6 },
+  calendar: [{ event: "investor_pitch", time: "today 2pm" }],
+  relationships: {
+    skeptical_cto: { concerns: ["security"], influence: 0.9 }
+  },
+  activeProjects: [{ name: "product_launch", deadline: "2026-04-15" }]
+};
+// Predict based on business context + psychology
+```
+
+### 7-Dimensional Scoring vs. Similarity Matching
+```javascript
+// CF: Single similarity score
+score = cosineSimilarity(userPrefs, itemFeatures);
+
+// Marble: Multi-dimensional business intelligence
+magic_score = interest(0.25) + temporal(0.30) + novelty(0.20)
+            + actionability(0.15) + source_trust(0.10)
+            × freshness_decay × stakeholder_alignment;
+```
+
+**Why competitors can't easily copy this:** Requires rebuilding recommendation infrastructure from scratch—context graphs, business metric optimization, relationship modeling, and temporal intelligence. Not a feature add to existing systems.
 
 ## Quick Start
 
-```javascript
-import { KnowledgeGraph, Scorer, Clone } from './core/marble';
-
-// Initialize with user data
-const kg = new KnowledgeGraph('./data/user.json');
-await kg.load();
-
-// Set today's context
-kg.setContext({
-  calendar: ['product demo', 'investor meeting'],
-  active_projects: ['shopify app', 'user onboarding'],
-  recent_conversations: ['pricing strategy', 'technical debt']
-});
-
-// DECISION COMPRESSION: Turn information overload into clear action
-const decisionEngine = new Scorer(kg, { mode: 'decision_compression' });
-const decisions = await decisionEngine.compress({
-  inputs: [...emails, ...slackMessages, ...reports],
-  output: 'what_matters_why_do_next'
-});
-
-console.log(`Critical: ${decisions.critical[0].matter}`);
-console.log(`Why: ${decisions.critical[0].why}`);
-console.log(`Do next: ${decisions.critical[0].do_next}`);
-
-// CONTENT CURATION: Personalized story ranking
-const contentScorer = new Scorer(kg, { mode: 'content_curation' });
-const rankedStories = await contentScorer.score(rawStories);
-
-console.log(rankedStories[0].story.title);
-console.log(`Because: ${rankedStories[0].why}`);
-
-// Record reaction to improve future recommendations
-kg.recordReaction(itemId, 'up', ['relevant', 'actionable'], 'email');
-await kg.save();
+```bash
+npm install marble
 ```
 
----
+```javascript
+import { Marble } from 'marble';
 
-## Core Components
+const marble = new Marble();
+const topStories = await marble.select(stories, {
+  interests: ['AI', 'startups'],
+  calendar: ['investor call 14:00'],
+  projects: ['newsletter platform']
+});
 
-| Component | Purpose | Key Methods |
-|-----------|---------|-------------|
-| **[KnowledgeGraph](docs/api-reference.md#knowledgegraph)** | User interest tracking with temporal decay | `recordReaction()`, `getInterestWeight()`, `setContext()` |
-| **[Scorer](docs/api-reference.md#scorer)** | Story ranking with multi-dimensional scoring | `score()`, Interest + Temporal + Novelty + Action + Trust |
-| **[Clone](docs/api-reference.md#clone)** | Digital twin for reaction simulation | `takeSnapshot()`, `simulateReaction()` |
-| **[Evolution](docs/api-reference.md#evolution)** | Adaptive learning and optimization | `evolveWeights()`, `findOptimalParameters()` |
-| **[Swarm](docs/api-reference.md#swarm)** | Multi-agent content processing | `processStories()`, `diversifySelection()` |
+topStories.forEach((story, i) => {
+  console.log(`${i+1}. [${story.score.toFixed(3)}] ${story.title}`);
+  console.log(`   Why: ${story.reasoning}`);
+});
+```
 
----
+**Learn from engagement (no buttons needed):**
+
+```javascript
+// Explicit feedback
+await marble.react('story-123', 'up', ['ai', 'productivity']);
+
+// Implicit signals (dwell time, clicks, shares)
+await marble.signal('story-456', 'dwell', { duration: 45000 });
+```
+
+**Run tests:**
+
+```bash
+git clone https://github.com/AlexShrestha/prism.git
+cd prism && npm install && npm test
+```
+
+## Features
+
+- **Zero API keys** — Core scoring runs locally with ONNX embeddings
+- **Privacy-first** — All computation happens on your machine
+- **Three modes** — Score (fast), Swarm (rich), WorldSim (B2B PMF)
+- **Implicit learning** — Learns from dwell time, scroll depth, forwards, silence
+- **Insight-driven KG** — Reasons about WHY, not just WHAT (see [docs/insight-kg.md](docs/insight-kg.md))
+- **Relationship-aware** — Models the people in a user's life to improve recommendations
+- **Narrative arc** — Stories sequenced for flow, not just ranked by score
+
+## How It Works
+
+```
+┌──────────────────────────────────────────────────┐
+│  1. GATHER                                        │
+│  RSS, HN, NewsAPI + World Signals (trends,        │
+│  search volume, social velocity)  ~100 stories    │
+├──────────────────────────────────────────────────┤
+│  2. SCORE / SWARM                                 │
+│  Score: magic_score formula (embeddings-based)     │
+│  Swarm: 5 agents evaluate through different lenses │
+├──────────────────────────────────────────────────┤
+│  3. ARC REORDER                                   │
+│  Sequence into narrative flow (opener → closer)    │
+├──────────────────────────────────────────────────┤
+│  4. DELIVER                                       │
+│  Telegram, Email, JSON API, Webhook, Video         │
+├──────────────────────────────────────────────────┤
+│  5. LEARN                                         │
+│  Implicit signals → KG updates → Clone evolution   │
+│  → Better predictions daily                        │
+└──────────────────────────────────────────────────┘
+```
+
+### Three Modes
+
+| Mode | What it does | Use case |
+|------|-------------|----------|
+| **Score** (v1) | Deterministic scoring against user KG | Fast, predictable, no API calls |
+| **Swarm** (v2) | Multi-agent evaluation with 5 specialized lenses | Richer selection, catches what scoring misses |
+| **WorldSim** (v3) | Population-level simulation for product-market fit | B2B — "which users for this product?" |
+
+### The Magic Score
+
+```
+magic_score = interest(0.25) + temporal(0.30) + novelty(0.20)
+            + actionability(0.15) + source_trust(0.10)
+            × freshness_decay
+```
+
+- **Interest match (25%)** — Semantic similarity via local ONNX embeddings
+- **Temporal relevance (30%)** — Is this relevant TODAY? (calendar, projects, deadlines)
+- **Novelty (20%)** — Surprise factor (inverse topic frequency)
+- **Actionability (15%)** — Can the user act on this?
+- **Source trust (10%)** — Learned per-source credibility
+
+### Swarm Agents
+
+Five agents, each asking a different question:
+
+| Agent | Weight | Question |
+|-------|--------|----------|
+| Career | 25% | "Will this help their business?" |
+| Timing | 25% | "Does this matter TODAY specifically?" |
+| Serendipity | 20% | "Would this delight them unexpectedly?" |
+| Growth | 15% | "Will this stretch their thinking?" |
+| Contrarian | 15% | "What is everyone else missing?" |
+
+## Architecture
+
+```
+marble/
+├── core/                 # The engine (standalone)
+│   ├── index.js         # Main Marble class — select(), react(), save()
+│   ├── kg.js            # Insight-driven knowledge graph (v2)
+│   ├── scorer.js        # magic_score computation
+│   ├── swarm.js         # Multi-agent curation (5 lenses)
+│   ├── clone.js         # Digital twin — user snapshot for simulation
+│   ├── evolution.js     # Clone population evolution
+│   ├── signals.js       # Implicit signal detection
+│   ├── arc.js           # Narrative arc reranking (10 slots)
+│   ├── decay.js         # Exponential decay (14-day half-life)
+│   ├── embeddings.js    # Local ONNX embeddings (384-dim)
+│   └── types.js         # Type definitions, weights
+│
+├── web/                 # Web reader + signal tracker + dashboard
+│   ├── reader.js        # Story page (tracks dwell, scroll, clicks)
+│   ├── tracker.js       # Signal collection endpoint
+│   └── dashboard.js     # User profile visualization
+│
+├── adapters/
+│   ├── sources/         # RSS, HackerNews, NewsAPI
+│   ├── delivery/        # Telegram, Email, API, Webhook
+│   └── signals/         # World signals (trends, velocity)
+│
+├── worldsim/            # World Clone — B2B product-market fit
+│   ├── archetypes.js    # Synthetic user population
+│   ├── pmf.js           # PMF analysis engine
+│   └── index.js         # WorldSim class
+│
+├── api/                 # REST API server
+├── test/                # Test harness (30 stories)
+├── examples/            # Integration examples
+└── docs/                # Detailed documentation
+    ├── architecture.md
+    ├── api-reference.md
+    ├── insight-kg.md
+    ├── archetypes-relationships.md
+    └── contributing.md
+```
+
+## Core Concepts
+
+### Knowledge Graph (Insight-Driven)
+
+Not a flat interest tracker. Marble's KG generates hypotheses about WHY a user cares about something, then tests those hypotheses with content.
+
+```
+         YOU (root)
+        / | \   \
+ projects interests people calendar
+    |        |        |       |
+"AhaRoll" "AI/web3" "Ilia" "call 14:00"
+    |        |        |       |
+[stories connecting to these nodes score higher]
+```
+
+Every signal triggers hypothesis generation, not just a weight increment. See [docs/insight-kg.md](docs/insight-kg.md) for the full deep-dive.
+
+### Digital Twin (Clone)
+
+A synthetic snapshot of the user for simulation. Captures weighted interests, behavioral patterns, today's context, and source trust. The evolution engine spawns N variants and kills the bottom 20% daily — survivors converge on real preferences within ~2 weeks.
+
+### Narrative Arc
+
+Top 10 stories aren't just ranked — they're sequenced:
+
+| Position | Role | Purpose |
+|----------|------|---------|
+| 1 | Opener | High energy, attention-grabbing |
+| 2 | Bridge | Transition to substance |
+| 3-4 | Deep dives | Core insights |
+| 5 | Pivot | Change of pace, surprise |
+| 6 | Deep dive | Third substantive piece |
+| 7 | Practical | Actionable, how-to |
+| 8 | Horizon | Future-looking |
+| 9 | Personal | Close to home |
+| 10 | Closer | Warm, human, memorable |
+
+### Signal Layers
+
+No thumbs-up/down needed. Three layers of implicit feedback:
+
+| Layer | Weight | Signals | User effort |
+|-------|--------|---------|-------------|
+| **World** | ~80% | Trends, search volume, social velocity | Zero |
+| **Sector** | ~15% | Industry forums, competitor activity | Zero |
+| **Personal** | ~5% | Dwell time, forwards, replies, silence | Passive |
+
+## Integration Modes
+
+### 1. Local-First (Recommended)
+
+```javascript
+const marble = new Marble({ mode: 'local' });
+const results = await marble.select(stories, userContext);
+```
+
+### 2. Enhanced (Optional LLM)
+
+```javascript
+const marble = new Marble({
+  mode: 'enhanced',
+  llm: async (prompt) => await yourLLMProvider(prompt)
+});
+```
+
+### 3. World Clone (B2B PMF)
+
+```javascript
+import { WorldSim } from 'marble/worldsim';
+const worldsim = new WorldSim();
+const pmf = await worldsim.simulate(yourProduct);
+console.log(`PMF Score: ${pmf.pmf_score}/1.0`);
+```
 
 ## Documentation
 
-| Guide | Description |
-|-------|-------------|
-| **[Installation & Setup](docs/installation.md)** | Requirements, npm install, configuration |
-| **[Usage Examples](docs/usage-examples.md)** | Real integration patterns for startups |
-| **[How It Works](docs/how-it-works.md)** | Data synthesis process explained simply |
-| **[API Reference](docs/api-reference.md)** | Complete method documentation |
-| **[Configuration](docs/configuration.md)** | Scoring weights, arc slots, customization |
-| **[Architecture](docs/architecture.md)** | System design and component relationships |
-| **[Performance](docs/performance.md)** | Benchmarks, optimization, scaling |
-| **[Migration Guide](docs/migration-guide.md)** | Upgrading from Prism to Marble |
-| **[Troubleshooting](docs/troubleshooting.md)** | Common issues and solutions |
-
----
-
-## Scoring Dimensions
-
-Marble uses five weighted dimensions to compute relevance scores:
-
-```javascript
-const SCORE_WEIGHTS = {
-  interest_match: 0.25,      // Topic relevance to user interests
-  temporal_relevance: 0.30,  // Relevance to current user context
-  novelty: 0.20,            // Content freshness and uniqueness
-  actionability: 0.15,       // Practical utility for current tasks
-  source_trust: 0.10        // Historical source quality
-};
-```
-
-**Design rationale:** Temporal relevance receives the highest weight because current context drives immediate decision-making. Interest match provides the foundation, while novelty and actionability ensure fresh, useful content delivery.
-
----
-
-## Narrative Arc Positioning
-
-Stories are arranged in a 10-slot narrative arc for optimal engagement:
-
-```
-1. OPENER    → High energy, attention-grabbing
-2. BRIDGE    → Transition to substance
-3. DEEP_1    → First deep-dive
-4. DEEP_2    → Second deep-dive
-5. PIVOT     → Change of pace / surprise
-6. DEEP_3    → Third deep-dive
-7. PRACTICAL → Actionable / how-to
-8. HORIZON   → Future-looking
-9. PERSONAL  → Close to home (local, relationships)
-10. CLOSER   → Warm, human, memorable
-```
-
----
-
-## Data Types
-
-### Story
-```javascript
-{
-  id: "story_123",
-  title: "OpenAI releases GPT-5",
-  summary: "New multimodal model with improved reasoning",
-  source: "techcrunch",
-  url: "https://...",
-  topics: ["ai", "openai", "llm"],
-  published_at: "2024-03-25T10:00:00Z",
-  valence: "inspiring",     // 'inspiring'|'alarming'|'neutral'|'fun'
-  actionability: 0.7        // 0-1, optional
-}
-```
-
-### ScoredStory
-```javascript
-{
-  story: { /* Story object */ },
-  composite_score: 0.85,     // Weighted combination of all dimensions
-  interest_match: 0.9,
-  temporal_relevance: 0.8,
-  novelty: 0.7,
-  actionability: 0.6,
-  source_trust: 0.8,
-  arc_position: 3,           // 1-10, narrative positioning (experimental)
-  explanation: "High relevance to current projects and interests"
-}
-```
-
----
-
-## Integration Examples
-
-### Executive Decision Dashboard
-```javascript
-// Daily decision compression for knowledge workers
-const decisions = await decisionEngine.compress({
-  inputs: [...emails, ...slackMessages, ...reports, ...notifications],
-  context: user.currentProjects,
-  timeframe: 'today'
-});
-const dashboard = { critical: decisions.critical, defer: decisions.defer };
-```
-
-### News App
-```javascript
-// Morning briefing with contextual ranking
-const briefing = await contentScorer.score(todaysStories);
-const top10 = briefing.slice(0, 10);
-```
-
-### Newsletter Platform
-```javascript
-// Personalized newsletter generation
-const clone = new Clone(kg);
-clone.takeSnapshot();
-
-const personalizedContent = await swarm.processStories(stories, clone);
-```
-
-### Enterprise Decision API
-```javascript
-// Decision prioritization endpoint
-app.get('/api/decisions', async (req, res) => {
-  const kg = await loadUserKG(req.user.id);
-  const compressed = await decisionEngine.compress(req.body.inputs);
-  res.json({
-    prioritized: compressed.critical,
-    total_items: req.body.inputs.length,
-    filtered_count: compressed.critical.length
-  });
-});
-```
-
----
-
-## Advanced Features
-
-### Semantic Matching
-Uses embeddings to match conceptually similar content even with different keywords.
-
-### Interest Decay
-Interests naturally decay over time (14-day half-life) unless reinforced by positive reactions.
-
-### Source Trust
-Builds trust scores for content sources based on user reaction patterns.
-
-### Digital Twin
-Clone can simulate user reactions for content pre-filtering and A/B testing.
-
-### Multi-Agent Processing
-Swarm intelligence for diverse content selection and quality control.
-
----
-
-## Requirements
-
-- Node.js 18+
-- 512MB RAM minimum (2GB recommended for embeddings)
-- Optional: OpenAI API key for semantic matching
-
----
-
-## Installation
-
-```bash
-npm install marble-engine
-# or from source
-git clone https://github.com/username/marble.git
-cd marble
-npm install
-```
-
-See [Installation Guide](docs/installation.md) for detailed setup instructions.
-
----
-
-## Performance
-
-Marble delivers fast content scoring with efficient resource usage:
-
-- **Scoring Speed:** ~1000 stories/second on modern hardware (M1 Mac tested)
-- **Memory Usage:** 100-500MB depending on embedding cache configuration
-- **Cold Start:** Immediate functionality with smart defaults for new users
-- **Storage:** Lightweight JSON persistence with SQLite scaling options
-
-See [Performance Guide](docs/performance.md) for optimization strategies and benchmarking details.
-
----
-
-## Migration from Prism
-
-Marble is the evolved version of Prism with improved semantic matching and multi-agent processing.
-
-```javascript
-// Prism → Marble migration
-const kg = new KnowledgeGraph('./prism-data.json');  // Same format
-const scorer = new Scorer(kg);  // Enhanced scoring algorithm
-```
-
-See [Migration Guide](docs/migration-guide.md) for step-by-step instructions.
-
----
-
-## Development
-
-```bash
-# Run tests
-npm test
-
-# Start development mode
-npm run dev
-
-# Test scoring pipeline
-node test-marble-scoring.js
-
-# Benchmark performance
-npm run benchmark
-```
-
----
-
-## Contributing
-
-1. Fork the repository
-2. Create feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit changes (`git commit -m 'Add amazing feature'`)
-4. Push branch (`git push origin feature/amazing-feature`)
-5. Open Pull Request
-
----
+| Doc | What it covers |
+|-----|---------------|
+| [Installation & Setup](docs/installation.md) | Full setup guide, configuration, adapters, troubleshooting |
+| [How It Works](docs/how-it-works.md) | The data synthesis process explained simply |
+| [Architecture](docs/architecture.md) | Full system design, data flow, component interactions |
+| [API Reference](docs/api-reference.md) | Every endpoint and function with examples |
+| [Usage Examples](docs/usage-examples.md) | Real code showing how to integrate Marble |
+| [Competitive Positioning](docs/competitive-positioning.md) | Why Marble isn't just "better collaborative filtering" |
+| [Insight-Driven KG](docs/insight-kg.md) | How Marble reasons about WHY, not just WHAT |
+| [Archetypes & Relationships](docs/archetypes-relationships.md) | Relationship simulation, archetype generation |
+| [Contributing](docs/contributing.md) | How to contribute to Marble |
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file for details.
-
----
-
-## Support
-
-- 📖 [Documentation](docs/)
-- 🐛 [Issue Tracker](https://github.com/username/marble/issues)
-- 💬 [Discussions](https://github.com/username/marble/discussions)
-- 📧 Email: support@marble-engine.com
-
----
-
-**Content scoring engine with user-centric knowledge graphs. Built for personalized information filtering and decision compression.**
+MIT
