@@ -817,6 +817,7 @@ Return ONLY a JSON object:
   "agents": [
     {
       "name": "snake_case_agent_name",
+      "exclusive_dimension": "ONE of: subject_matter | format_style | emotional_register | novelty_familiarity | social_context | depth_complexity | practical_utility | aesthetic_fit",
       "motivation_frame": "one sentence — what satisfaction dimension this agent probes for this user",
       "screening_question": "the single most predictive yes/no question this agent asks",
       "weight": 0.0-1.0,
@@ -831,7 +832,8 @@ Return ONLY a JSON object:
 Rules:
 - All agent weights must sum to 1.0
 - Agent names must NOT be: career, growth, timing, contrarian, serendipity (those are generic professional lenses)
-- Each agent must be meaningfully different from the others
+- ORTHOGONALITY: each agent MUST have a DIFFERENT exclusive_dimension. No two agents may share the same exclusive_dimension value. This is a hard constraint — questions from two agents with the same dimension would be redundant duplicates.
+- Each agent's screening_question must be answerable ONLY from its exclusive_dimension — never bleed into another agent's territory
 - screening_question must be specific enough that two similar items could get different answers`;
 
   const response = await client.messages.create({
@@ -1012,6 +1014,8 @@ export async function explodeAgentQuestions(agent, contentSample, kgSummary, llm
   const negativeSignals = (agentSpec.negative_signals || agentSpec.penalty_keywords || []).slice(0, 4).join(', ');
   const interestAnchors = (agentSpec.interest_anchors || agentSpec.interest_topics || []).slice(0, 8).join(', ');
   const inferredMotivation = agentSpec.inferred_motivation || '';
+  const exclusiveDimension = agentSpec.exclusive_dimension || '';
+  const siblingQuestions = (opts.siblingQuestions || []).slice(0, 12).join('\n  - ');
 
   // Compact user profile for question generation
   const kg = kgSummary || {};
@@ -1026,7 +1030,9 @@ export async function explodeAgentQuestions(agent, contentSample, kgSummary, llm
 
 Your motivation frame: ${motivationFrame}
 Your core screening question: ${screeningQuestion}
+${exclusiveDimension ? `Your EXCLUSIVE dimension: ${exclusiveDimension}. You ONLY ask questions that probe this dimension. Questions about other dimensions belong to sibling agents and must NOT appear in your output.` : ''}
 ${inferredMotivation ? `Why this user consumes this content type: ${inferredMotivation}` : ''}
+${siblingQuestions ? `FORBIDDEN — these questions are already covered by sibling agents (do NOT ask anything semantically similar):\n  - ${siblingQuestions}` : ''}
 
 This user's taste profile:
 ${topInterests ? `- Strong interests: ${topInterests}` : ''}
@@ -1121,6 +1127,86 @@ Return ONLY a JSON array, no commentary:
 // ── Sparse Content Scoring ────────────────────────────────────────────────────
 
 /**
+ * Generate 2 dimension-specific structural questions for sparse content.
+ *
+ * Each exclusive_dimension maps to a different observable signal so that sibling
+ * agents do NOT produce the same question for the same item. This is the fix for
+ * the original bug where all agents asked identical genre/history questions,
+ * causing massive cross-agent redundancy on MovieLens (sparse) content.
+ */
+function _sparseQuestionsForDimension(dim, contentGenres, allAnchors, negatives, history, kg) {
+  const genreHit = contentGenres.some(g => allAnchors.includes(g));
+  const matchedGenres = contentGenres.filter(g => allAnchors.includes(g)).join(', ');
+
+  const historyLiked = history.filter(h => h.reaction === 'liked' || h.score > 0.6);
+  const historyHit = historyLiked.some(h => {
+    const hGenres = _normalizeGenres(h);
+    return hGenres.some(g => contentGenres.includes(g));
+  });
+
+  const historyDisliked = history.filter(h => h.reaction === 'disliked' || h.score < 0.3);
+  const dislikeHit = historyDisliked.some(h => {
+    const hGenres = _normalizeGenres(h);
+    return hGenres.some(g => contentGenres.includes(g));
+  });
+
+  // Infer novelty: content genre not found in user's liked history = novel territory
+  const likedGenres = new Set(historyLiked.flatMap(h => _normalizeGenres(h)));
+  const isNovel = contentGenres.length > 0 && contentGenres.every(g => !likedGenres.has(g));
+  const isFamiliar = contentGenres.some(g => likedGenres.has(g));
+
+  // Infer popularity proxy: if genre appears in many liked items = socially mainstream for user
+  const genreFreq = {};
+  for (const h of history) for (const g of _normalizeGenres(h)) genreFreq[g] = (genreFreq[g] || 0) + 1;
+  const maxFreq = Math.max(1, ...Object.values(genreFreq));
+  const isPopularForUser = contentGenres.some(g => (genreFreq[g] || 0) / maxFreq > 0.3);
+
+  // Depth proxy: drama/documentary/biography → deeper; action/comedy → lighter
+  const deepGenres = ['drama', 'documentary', 'biography', 'mystery', 'thriller', 'war', 'history'];
+  const lightGenres = ['comedy', 'animation', 'family', 'musical', 'sport'];
+  const isDeep = contentGenres.some(g => deepGenres.includes(g));
+  const isLight = contentGenres.some(g => lightGenres.includes(g));
+  const prefersDeep = (kg.preferences?.depth || 'medium') === 'deep';
+
+  const map = {
+    subject_matter: [
+      { question: `Does this content's primary genre/subject match one of this user's known preferences?`, fired: genreHit, confidence: genreHit ? 0.85 : 0.15, evidence: genreHit ? `genre overlap: ${matchedGenres}` : 'no genre overlap' },
+      { question: `Has this user positively engaged with this genre in their history?`, fired: historyHit, confidence: historyHit ? 0.80 : 0.45, evidence: historyHit ? 'genre in liked history' : 'not found in liked history' },
+    ],
+    emotional_register: [
+      { question: `Does the emotional tone of this content (drama/comedy/thriller) match what this user gravitates toward?`, fired: isFamiliar, confidence: isFamiliar ? 0.75 : 0.40, evidence: isFamiliar ? 'tone genre in liked history' : 'tone genre not in liked history' },
+      { question: `Does this content avoid the emotional registers this user has historically disengaged from?`, fired: !dislikeHit, confidence: dislikeHit ? 0.80 : 0.65, evidence: dislikeHit ? 'genre in disliked history' : 'not in disliked history' },
+    ],
+    novelty_familiarity: [
+      { question: `Is this content in territory the user hasn't extensively explored (novel genre)?`, fired: isNovel, confidence: isNovel ? 0.70 : 0.50, evidence: isNovel ? 'genre not in liked history' : 'genre already in liked history' },
+      { question: `Is this content familiar enough that the user is likely to engage rather than bounce?`, fired: isFamiliar, confidence: isFamiliar ? 0.75 : 0.45, evidence: isFamiliar ? 'genre in liked history' : 'unfamiliar genre' },
+    ],
+    depth_complexity: [
+      { question: `Does the complexity/depth of this content match this user's stated or inferred preference?`, fired: prefersDeep ? isDeep : !isDeep, confidence: (prefersDeep ? isDeep : isLight) ? 0.80 : 0.50, evidence: isDeep ? 'deep-genre detected' : isLight ? 'light-genre detected' : 'depth unknown' },
+      { question: `Does this content avoid the depth level this user consistently skips?`, fired: !(prefersDeep ? isLight : isDeep), confidence: 0.65, evidence: 'inferred from genre depth category' },
+    ],
+    social_context: [
+      { question: `Is this content in a genre that is mainstream/popular for users with this profile?`, fired: isPopularForUser, confidence: isPopularForUser ? 0.70 : 0.45, evidence: isPopularForUser ? 'genre appears frequently in user history' : 'genre underrepresented in user history' },
+      { question: `Does this content belong to genres with strong community/social appeal for this user type?`, fired: isFamiliar, confidence: 0.60, evidence: 'inferred from genre-history overlap' },
+    ],
+    practical_utility: [
+      { question: `Does this content serve a clear practical purpose for this user (learning, reference, skill)?`, fired: genreHit, confidence: genreHit ? 0.70 : 0.30, evidence: genreHit ? `anchored genre: ${matchedGenres}` : 'no practical anchor genres found' },
+      { question: `Is this content's utility-to-entertainment ratio consistent with this user's consumption pattern?`, fired: historyHit, confidence: historyHit ? 0.65 : 0.45, evidence: historyHit ? 'genre in liked history' : 'not in liked history' },
+    ],
+    aesthetic_fit: [
+      { question: `Does the genre/style of this content match this user's aesthetic sensibility (e.g. art-house vs. mainstream)?`, fired: isFamiliar, confidence: isFamiliar ? 0.70 : 0.45, evidence: isFamiliar ? 'stylistic genre overlap in history' : 'no style match' },
+      { question: `Does this content avoid genres this user finds aesthetically off-putting?`, fired: !dislikeHit, confidence: dislikeHit ? 0.80 : 0.60, evidence: dislikeHit ? 'genre in disliked history' : 'no aesthetic conflict' },
+    ],
+    format_style: [
+      { question: `Does the format/presentation genre (e.g. documentary, animation) match user preferences?`, fired: isFamiliar, confidence: isFamiliar ? 0.70 : 0.40, evidence: isFamiliar ? 'format genre in history' : 'format genre not in history' },
+      { question: `Is the content format one this user has historically engaged with?`, fired: historyHit, confidence: historyHit ? 0.75 : 0.40, evidence: historyHit ? 'format genre liked' : 'format not in liked history' },
+    ],
+  };
+
+  return map[dim] || map['subject_matter'];
+}
+
+/**
  * Direct structural scoring for sparse content (< 40 words, e.g. MovieLens items).
  *
  * When content is title + genres only, LLM question explosion is meaningless:
@@ -1169,26 +1255,22 @@ function _sparseContentScore(agentSpec, contentSample, kgSummary) {
     return (h.reaction === 'liked' || h.score > 0.6) && hGenres.some(g => contentGenres.includes(g));
   });
 
-  const questions = [
-    {
-      question: `Does this content's genre/type match one of this user's known preferences?`,
-      fired: genreHit,
-      confidence: genreHit ? 0.85 : 0.15,
-      evidence: genreHit ? `genre overlap: ${contentGenres.filter(g => allAnchors.includes(g)).join(', ')}` : 'no genre overlap found',
-    },
-    {
-      question: `Does this content avoid categories this user has disengaged from?`,
-      fired: !genrePenalty,
-      confidence: genrePenalty ? 0.8 : 0.7,
-      evidence: genrePenalty ? `penalty genre hit: ${contentGenres.filter(g => negatives.includes(g)).join(', ')}` : 'no avoidance patterns triggered',
-    },
-    {
-      question: `Has this user historically engaged with content in similar genres?`,
-      fired: historyHit,
-      confidence: historyHit ? 0.75 : 0.5,
-      evidence: historyHit ? 'genre found in liked history' : 'no liked history match',
-    },
-  ];
+  // Dimension-specific question sets for sparse content.
+  // Each exclusive_dimension gets a distinct structural question to prevent
+  // all agents from asking the same 3 genre questions (the original redundancy bug).
+  const dim = (agentSpec.exclusive_dimension || 'subject_matter').toLowerCase();
+  const dimQuestions = _sparseQuestionsForDimension(dim, contentGenres, allAnchors, negatives, history, kg);
+
+  // Always include a hard avoidance gate regardless of dimension
+  const avoidanceQ = {
+    question: `Does this content avoid categories this user has disengaged from?`,
+    fired: !genrePenalty,
+    confidence: genrePenalty ? 0.8 : 0.7,
+    evidence: genrePenalty ? `penalty genre hit: ${contentGenres.filter(g => negatives.includes(g)).join(', ')}` : 'no avoidance patterns triggered',
+  };
+
+  // Combine: 2 dimension-specific questions + 1 shared avoidance gate
+  const questions = [...dimQuestions.slice(0, 2), avoidanceQ];
 
   const questionsWithData = questions.length;
   const scoreSum = questions.reduce((s, q) => s + (q.fired ? q.confidence : 0), 0);
@@ -1322,4 +1404,84 @@ export function resolveAgentWeights(priorWeights, agentScoreMatrix = null, learn
     normalized[name] = total > 0 ? Math.round((blended[name] / total) * 1000) / 1000 : 1 / agentNames.length;
   }
   return normalized;
+}
+
+// ── Cross-Agent Question Deduplication ────────────────────────────────────────
+
+/**
+ * Remove semantically redundant questions across multiple agent results.
+ *
+ * When running a multi-agent swarm, sibling agents may still generate overlapping
+ * questions despite exclusive_dimension constraints (e.g. LLM prompt non-compliance,
+ * or fallback agents with no exclusive_dimension). This function detects near-duplicate
+ * questions by Jaccard similarity on normalized word tokens and drops the lower-confidence
+ * duplicate, keeping only the most informative signal per conceptual slot.
+ *
+ * Design choice: Jaccard over word tokens is fast, zero-dependency, and sufficient for
+ * catching phrase-level overlap ("Does this match user preferences?" x 3 agents).
+ * Embedding-based similarity would catch more subtle overlaps but costs an LLM call.
+ *
+ * @param {Array<{agent: string, questions: Array<{question: string, fired: boolean, confidence: number, evidence: string}>}>} agentResults
+ *   Array of per-agent results from explodeAgentQuestions
+ * @param {number} [threshold=0.55] - Jaccard similarity above which two questions are considered duplicates
+ * @returns {Array} Same shape as input, with duplicate questions zeroed out (confidence=0, fired=false, note added)
+ */
+export function deduplicateAgentQuestions(agentResults, threshold = 0.55) {
+  if (!Array.isArray(agentResults) || agentResults.length === 0) return agentResults;
+
+  // Flatten all questions with (agentIdx, qIdx, tokens, confidence)
+  const flat = [];
+  for (let ai = 0; ai < agentResults.length; ai++) {
+    const qs = agentResults[ai].questions || [];
+    for (let qi = 0; qi < qs.length; qi++) {
+      const tokens = new Set(
+        (qs[qi].question || '').toLowerCase()
+          .replace(/[^a-z0-9\s]/g, '')
+          .split(/\s+/)
+          .filter(w => w.length > 2)
+      );
+      flat.push({ ai, qi, tokens, confidence: qs[qi].confidence || 0, kept: true });
+    }
+  }
+
+  // Compare all pairs: drop lower-confidence duplicate
+  for (let i = 0; i < flat.length; i++) {
+    if (!flat[i].kept) continue;
+    for (let j = i + 1; j < flat.length; j++) {
+      if (!flat[j].kept) continue;
+      // Skip same agent (within-agent diversity already enforced by DIVERSITY CONSTRAINT)
+      if (flat[i].ai === flat[j].ai) continue;
+
+      const intersection = [...flat[i].tokens].filter(t => flat[j].tokens.has(t)).length;
+      const union = new Set([...flat[i].tokens, ...flat[j].tokens]).size;
+      const jaccard = union > 0 ? intersection / union : 0;
+
+      if (jaccard >= threshold) {
+        // Drop the one with lower confidence; on tie, drop the later one
+        const dropIdx = flat[i].confidence >= flat[j].confidence ? j : i;
+        flat[dropIdx].kept = false;
+      }
+    }
+  }
+
+  // Reconstruct results with dropped questions zeroed
+  const result = agentResults.map((ar, ai) => ({
+    ...ar,
+    questions: (ar.questions || []).map((q, qi) => {
+      const entry = flat.find(f => f.ai === ai && f.qi === qi);
+      if (entry && !entry.kept) {
+        return { ...q, fired: false, confidence: 0, evidence: `[deduplicated — covered by sibling agent]` };
+      }
+      return q;
+    }),
+  }));
+
+  // Recompute per-agent scores after dedup
+  return result.map(ar => {
+    const qs = ar.questions || [];
+    const qWithData = qs.filter(q => q.confidence > 0).length;
+    const scoreSum = qs.reduce((s, q) => s + (q.fired && q.confidence > 0 ? q.confidence : 0), 0);
+    const score = qWithData > 0 ? Math.round((scoreSum / qWithData) * 1000) / 1000 : 0;
+    return { ...ar, score, questionsWithData: qWithData };
+  });
 }
