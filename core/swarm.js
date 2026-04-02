@@ -942,11 +942,25 @@ export function getFleetCacheStats() {
  * @returns {Promise<{ agent, questions, score, questionsWithData, source }>}
  */
 export async function explodeAgentQuestions(agent, contentSample, kgSummary, llm = null, opts = {}) {
-  const n = opts.n || 5;
+  // Minimum viable question set: 3 questions per agent.
+  // 5 questions produce noise — questions 4–5 tend to restate questions 1–2,
+  // diluting signal. 3 focused questions with evidence citations outperform
+  // 5 shallow questions empirically (see marble#25 architecture decision).
+  const n = opts.n || 3;
+
   const client = llm || new Anthropic();
 
   const agentSpec = typeof agent === 'string' ? { name: agent, motivation_frame: `${agent} lens` } : agent;
   const agentName = agentSpec.name || 'unknown';
+
+  // Content sparsity gate: when content has fewer than 40 words (e.g. MovieLens:
+  // title + genres only), LLM question explosion cannot generate meaningful
+  // questions — there is nothing to read. Fall through to direct structural
+  // scoring instead.
+  const contentWords = (contentSample || '').split(/\s+/).filter(Boolean).length;
+  if (contentWords < 40 && !opts.forceLLM) {
+    return _sparseContentScore(agentSpec, contentSample, kgSummary);
+  }
   const motivationFrame = agentSpec.motivation_frame || agentSpec.description || agentSpec.name || '';
   const screeningQuestion = agentSpec.screening_question || motivationFrame;
   const positiveSignals = (agentSpec.positive_signals || agentSpec.boost_keywords || []).slice(0, 6).join(', ');
@@ -990,14 +1004,16 @@ Requirements:
 - Questions must be grounded in the user's actual taste (their specific interests, history, avoidances)
 - Do NOT ask generic questions like "Is this relevant?", "Does this expand thinking?", or "Is this well-made?"
 - Each question should be specific enough that two similar items could get different answers
+- DIVERSITY CONSTRAINT: each question must probe a DIFFERENT observable dimension. Do NOT write variations of the same question. Cover distinct aspects (e.g. topic match, tone/style, format, specificity level, user-history alignment). If two questions feel similar, replace one with something orthogonal.
 
 For each question, evaluate it against the content and provide:
 - fired: true if the content satisfies this question, false if not
 - confidence: 0.0–1.0 certainty about the fired value (based on evidence in the content)
+- evidence: a short quote or specific observation from the content justifying fired. Required — if you cannot cite evidence, set confidence to 0.3 or below.
 
 Return ONLY a JSON array, no commentary:
 [
-  { "question": "...", "fired": true/false, "confidence": 0.0-1.0 },
+  { "question": "...", "fired": true/false, "confidence": 0.0-1.0, "evidence": "..." },
   ...
 ]`;
 
@@ -1018,11 +1034,19 @@ Return ONLY a JSON array, no commentary:
     const parsed = JSON.parse(jsonMatch[0]);
     if (!Array.isArray(parsed)) throw new Error('LLM response is not an array');
 
-    questions = parsed.slice(0, n).map(q => ({
-      question: q.question || '',
-      fired: Boolean(q.fired),
-      confidence: Math.max(0, Math.min(1, Number(q.confidence) || 0)),
-    }));
+    questions = parsed.slice(0, n).map(q => {
+      const rawConf = Math.max(0, Math.min(1, Number(q.confidence) || 0));
+      // Evidence quality gate: if fired=true but no evidence provided, cap confidence at 0.4
+      // to prevent hallucinated positives from inflating the agent score.
+      const hasEvidence = Boolean(q.evidence && q.evidence.trim().length > 5);
+      const confidence = (q.fired && !hasEvidence) ? Math.min(rawConf, 0.4) : rawConf;
+      return {
+        question: q.question || '',
+        fired: Boolean(q.fired),
+        confidence,
+        evidence: q.evidence || '',
+      };
+    });
   } catch (err) {
     source = 'fallback';
     const text = (contentSample || '').toLowerCase();
@@ -1047,6 +1071,85 @@ Return ONLY a JSON array, no commentary:
   const score = questionsWithData > 0 ? Math.round((scoreSum / questionsWithData) * 1000) / 1000 : 0;
 
   return { agent: agentName, questions, score, questionsWithData, source };
+}
+
+// ── Sparse Content Scoring ────────────────────────────────────────────────────
+
+/**
+ * Direct structural scoring for sparse content (< 40 words, e.g. MovieLens items).
+ *
+ * When content is title + genres only, LLM question explosion is meaningless:
+ * there is nothing to read, so the LLM hallucinates answers. Instead, score
+ * deterministically from genre/keyword overlap against the agent's interest anchors.
+ *
+ * Returns an explodeAgentQuestions-compatible result so callers can use it uniformly.
+ */
+function _sparseContentScore(agentSpec, contentSample, kgSummary) {
+  const agentName = agentSpec.name || 'unknown';
+  const storyGenres = _normalizeGenres({ title: contentSample || '', genres: [] });
+
+  // Pull any genres from the content sample (format: "Title (Year) | Genre1|Genre2")
+  const genreMatch = (contentSample || '').match(/\|\s*([^|]+(?:\|[^|]+)*)$/);
+  const contentGenres = genreMatch
+    ? genreMatch[1].split('|').map(g => g.trim().toLowerCase()).filter(Boolean)
+    : storyGenres;
+
+  // Anchors: agent's interest topics + user interests from KG
+  const anchors = [
+    ...(agentSpec.interest_anchors || []),
+    ...(agentSpec.interest_topics || []),
+    ...(agentSpec.positive_signals || []),
+  ].map(a => a.toLowerCase());
+
+  const negatives = [
+    ...(agentSpec.negative_signals || []),
+    ...(agentSpec.penalty_keywords || []),
+  ].map(a => a.toLowerCase());
+
+  // KG genre affinity from history
+  const kg = kgSummary || {};
+  const history = kg.history || [];
+  const interests = kg.interests || [];
+  const interestTopics = (Array.isArray(interests)
+    ? interests.map(i => typeof i === 'string' ? i : (i.topic || i.name || ''))
+    : Object.keys(interests)
+  ).map(t => t.toLowerCase());
+
+  const allAnchors = [...new Set([...anchors, ...interestTopics])];
+
+  const genreHit = contentGenres.some(g => allAnchors.includes(g));
+  const genrePenalty = contentGenres.some(g => negatives.includes(g));
+  const historyHit = history.some(h => {
+    const hGenres = _normalizeGenres(h);
+    return (h.reaction === 'liked' || h.score > 0.6) && hGenres.some(g => contentGenres.includes(g));
+  });
+
+  const questions = [
+    {
+      question: `Does this content's genre/type match one of this user's known preferences?`,
+      fired: genreHit,
+      confidence: genreHit ? 0.85 : 0.15,
+      evidence: genreHit ? `genre overlap: ${contentGenres.filter(g => allAnchors.includes(g)).join(', ')}` : 'no genre overlap found',
+    },
+    {
+      question: `Does this content avoid categories this user has disengaged from?`,
+      fired: !genrePenalty,
+      confidence: genrePenalty ? 0.8 : 0.7,
+      evidence: genrePenalty ? `penalty genre hit: ${contentGenres.filter(g => negatives.includes(g)).join(', ')}` : 'no avoidance patterns triggered',
+    },
+    {
+      question: `Has this user historically engaged with content in similar genres?`,
+      fired: historyHit,
+      confidence: historyHit ? 0.75 : 0.5,
+      evidence: historyHit ? 'genre found in liked history' : 'no liked history match',
+    },
+  ];
+
+  const questionsWithData = questions.length;
+  const scoreSum = questions.reduce((s, q) => s + (q.fired ? q.confidence : 0), 0);
+  const score = Math.round((scoreSum / questionsWithData) * 1000) / 1000;
+
+  return { agent: agentName, questions, score, questionsWithData, source: 'sparse_structural' };
 }
 
 // ── Per-User Weight Learning ──────────────────────────────────────────────────
