@@ -643,32 +643,22 @@ Rules:
   return parsed.agents.map(a => ({ ...a, inferred_motivation: motivation }));
 }
 
-// Domain-appropriate static fallback frames — NOT generic professional lenses
-const _STATIC_FLEET_FRAMES = {
-  movies: [
-    { name: 'genre_resonance',    motivation_frame: 'Does this match the genres and tones this user consistently enjoys?',            weight: 0.30 },
-    { name: 'emotional_depth',    motivation_frame: 'Does this offer the emotional weight and complexity this user seeks?',            weight: 0.25 },
-    { name: 'era_and_style',      motivation_frame: 'Does the era, visual style, or pacing match this user\'s aesthetic preferences?', weight: 0.20 },
-    { name: 'avoidance_check',    motivation_frame: 'Does this avoid the genres or patterns this user consistently dislikes?',         weight: 0.15 },
-    { name: 'thematic_alignment', motivation_frame: 'Do the themes align with subjects this user finds meaningful or engaging?',       weight: 0.10 },
-  ],
-  default: [
-    { name: 'interest_fit',       motivation_frame: 'Does this directly match topics this user has expressed strong interest in?',     weight: 0.30 },
-    { name: 'depth_match',        motivation_frame: 'Does this match the depth and complexity level this user prefers?',               weight: 0.25 },
-    { name: 'pattern_alignment',  motivation_frame: 'Does this fit the consumption patterns visible in this user\'s history?',         weight: 0.25 },
-    { name: 'avoidance_check',    motivation_frame: 'Does this avoid topics or styles this user consistently disengages from?',        weight: 0.20 },
-  ],
-};
+// Generic fallback agents — used only when LLM fleet generation fails.
+// These are intentionally domain-agnostic: the LLM path is responsible for
+// producing domain/motivation-specific agents. This is just a safety net.
+const _FALLBACK_AGENT_FRAMES = [
+  { name: 'interest_fit',      motivation_frame: 'Does this directly match what this user has shown interest in?',            weight: 0.30 },
+  { name: 'pattern_match',     motivation_frame: 'Does this fit the consumption pattern visible in this user\'s history?',    weight: 0.30 },
+  { name: 'avoidance_check',   motivation_frame: 'Does this avoid topics or styles this user consistently disengages from?',  weight: 0.25 },
+  { name: 'depth_preference',  motivation_frame: 'Does this match the depth and complexity this user tends to prefer?',       weight: 0.15 },
+];
 
 function _buildStaticFleet(domain) {
-  const domainKey = domain?.toLowerCase();
-  const frames = _STATIC_FLEET_FRAMES[domainKey] || _STATIC_FLEET_FRAMES.default;
-
-  const specs = frames.map(frame => ({
+  const specs = _FALLBACK_AGENT_FRAMES.map(frame => ({
     name: frame.name,
     weight: frame.weight,
     motivation_frame: frame.motivation_frame,
-    screening_question: frame.motivation_frame, // reuse as question in fallback
+    screening_question: frame.motivation_frame,
     scoreFn: _buildSpecScorer({
       name: frame.name,
       boost_keywords: [],
