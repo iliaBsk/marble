@@ -446,7 +446,17 @@ export function genreOverlapScore(story, kg) {
  * @param {Object} kg - Knowledge graph / user clone
  * @returns {{ score: number, agentScores: Object, genreScore: number, motivationScore: number }}
  */
-export function swarmScore(story, kg) {
+/**
+ * @param {Object} story
+ * @param {Object} kg - Knowledge graph / user clone
+ * @param {Object} [opts]
+ * @param {number|null} [opts.collaborativeScore] - Pre-computed CF score (0–1) from
+ *   globalCollaborativeFilter or similar. When provided, blended as a third signal.
+ *   CF and swarm are COMPLEMENTARY: CF captures population patterns ("users like you"),
+ *   swarm captures individual motivation ("this specific user"). Neither competes —
+ *   both are included when available. See AlexShrestha/marble#25 for rationale.
+ */
+export function swarmScore(story, kg, opts = {}) {
   const clone = new Clone(kg);
   clone.takeSnapshot();
 
@@ -505,16 +515,51 @@ export function swarmScore(story, kg) {
     genreScore = scores.reduce((s, v) => s + v, 0) / scores.length;
   }
 
-  // ── Hybrid blend: genre takes majority when genres are available ──────
-  const score = hasStructuredGenres
-    ? genreScore * 0.6 + motivationScore * 0.4
-    : motivationScore;
+  // ── Sparse-content detection ─────────────────────────────────────────
+  // When content has < 40 words (e.g. MovieLens: title + genres only), the
+  // motivation agents cannot differentiate items — they have nothing to read.
+  // Empirically, on MovieLens u1.base the 60/40 blend hurt precision vs pure
+  // genre overlap because the 0.4 motivation weight diluted a clean genre signal
+  // with near-random engagement scores. Fix: weight genre much higher on sparse
+  // content so motivation noise does not drag down well-calibrated genre affinity.
+  const contentWords = `${story.title || ''} ${story.summary || ''} ${story.description || ''}`
+    .split(/\s+/).filter(Boolean).length;
+  const isSparse = contentWords < 40;
+
+  // ── Hybrid blend: CF + genre + motivation ────────────────────────────
+  // Architecture decision (marble#25): swarm COMPLEMENTS collaborative filtering.
+  //   CF = population signal ("users like you liked X")
+  //   genre = structural match signal
+  //   motivation = individual signal ("why THIS user consumes this content")
+  // When all three are available, blend them. When CF is absent, rely on genre+motivation.
+  const collabScore = opts.collaborativeScore ?? null;
+  const hasCollab = collabScore !== null && !Number.isNaN(collabScore);
+
+  let score;
+  if (hasCollab && hasStructuredGenres) {
+    // Three-signal blend
+    score = isSparse
+      ? collabScore * 0.40 + genreScore * 0.40 + motivationScore * 0.20
+      : collabScore * 0.30 + genreScore * 0.40 + motivationScore * 0.30;
+  } else if (hasCollab) {
+    // No genre structure (news, articles): CF + motivation
+    score = collabScore * 0.50 + motivationScore * 0.50;
+  } else if (hasStructuredGenres) {
+    // No CF: weight genre higher on sparse content to avoid motivation noise
+    score = isSparse
+      ? genreScore * 0.80 + motivationScore * 0.20
+      : genreScore * 0.60 + motivationScore * 0.40;
+  } else {
+    score = motivationScore;
+  }
 
   return {
     score: Math.round(score * 1000) / 1000,
     agentScores,
     genreScore: Math.round(genreScore * 1000) / 1000,
     motivationScore: Math.round(motivationScore * 1000) / 1000,
+    collaborativeScore: hasCollab ? Math.round(collabScore * 1000) / 1000 : null,
+    isSparse,
   };
 }
 
