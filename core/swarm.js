@@ -1048,3 +1048,130 @@ Return ONLY a JSON array, no commentary:
 
   return { agent: agentName, questions, score, questionsWithData, source };
 }
+
+// ── Per-User Weight Learning ──────────────────────────────────────────────────
+
+/**
+ * Three-layer weight determination architecture:
+ *
+ * Layer 1 — LLM-inferred prior (from _generateFleetFromLLM)
+ *   The LLM assigns weights based on motivation inference. Fast, works at cold
+ *   start, but uncalibrated: educated guesses about what this user values.
+ *
+ * Layer 2 — Discriminability calibration (computeDynamicWeights)
+ *   After scoring a candidate batch, agents that scored all candidates identically
+ *   contribute no signal and get near-zero weight. Agents that differentiate
+ *   candidates get boosted. Prevents dead-weight agents from diluting the ensemble.
+ *
+ * Layer 3 — Feedback-driven Bayesian update (learnWeightsFromFeedback)
+ *   Each time a user likes/dislikes an item, shift weights toward agents that
+ *   predicted correctly. Converges to a per-user weight profile over ~20 events.
+ *
+ * Architecture decision: dynamically inferred per user.
+ * - Static weights ignore individual variation (user A is genre-driven, user B is era-driven)
+ * - Learned-only weights require interaction history (cold start gap)
+ * - LLM-inferred + discriminability covers cold start; feedback loop fills in as data grows
+ *
+ * @see computeDynamicWeights — Layer 2 implementation
+ * @see learnWeightsFromFeedback — Layer 3 implementation
+ * @see resolveAgentWeights — Merges all three layers into final weight vector
+ */
+
+/**
+ * Update agent weights based on user feedback events.
+ *
+ * For each feedback event, agents that correctly predicted the outcome
+ * (high score on liked items, low score on disliked items) receive a
+ * weight boost. Agents that predicted incorrectly receive a reduction.
+ *
+ * Formula: w_new[a] = w_old[a] × (1 + lr × signal[a])
+ * where signal[a] = liked ? (agentScore[a] - 0.5) : (0.5 - agentScore[a])
+ *
+ * @param {Array<Object>} feedbackBatch - Array of { agentScores, liked, weight? }
+ *   agentScores: { [agentName]: 0–1 }  — scores this item received from each agent
+ *   liked: boolean                     — whether the user liked this item
+ *   weight: number (optional)          — importance of this event (default 1.0)
+ * @param {Object} currentWeights - Current normalized weights { [agentName]: number }
+ * @param {Object} [opts]
+ *   lr: learning rate (default 0.15)   — higher = faster adaptation, more volatile
+ *   minWeight: floor (default 0.02)    — no agent fully disappears
+ * @returns {Object} Updated normalized weights
+ */
+export function learnWeightsFromFeedback(feedbackBatch, currentWeights, opts = {}) {
+  const lr = opts.lr ?? 0.15;
+  const minWeight = opts.minWeight ?? 0.02;
+
+  if (!feedbackBatch || feedbackBatch.length === 0) return { ...currentWeights };
+
+  const agentNames = Object.keys(currentWeights);
+  const weights = { ...currentWeights };
+
+  for (const event of feedbackBatch) {
+    const { agentScores = {}, liked, weight: eventWeight = 1.0 } = event;
+
+    for (const name of agentNames) {
+      const score = agentScores[name] ?? 0.5;
+      // Positive signal when agent correctly predicted outcome:
+      // liked + high score → boost; liked + low score → penalize
+      // disliked + low score → boost; disliked + high score → penalize
+      const signal = liked ? (score - 0.5) : (0.5 - score);
+      weights[name] = Math.max(minWeight, weights[name] * (1 + lr * signal * eventWeight));
+    }
+  }
+
+  // Renormalize to sum=1
+  const total = Object.values(weights).reduce((s, w) => s + w, 0);
+  if (total === 0) return { ...currentWeights };
+
+  const normalized = {};
+  for (const name of agentNames) {
+    normalized[name] = Math.round((weights[name] / total) * 1000) / 1000;
+  }
+  return normalized;
+}
+
+/**
+ * Merge all three weight layers into a final weight vector.
+ *
+ * Priority: learned > discriminability-calibrated > LLM-inferred prior.
+ * When learnedWeights is provided, it dominates but is tempered by the prior
+ * to prevent overfitting on sparse feedback.
+ *
+ * @param {Object} priorWeights - Layer 1: LLM-assigned weights
+ * @param {Array<Object>} [agentScoreMatrix] - Layer 2: per-item agent scores for discriminability
+ * @param {Object} [learnedWeights] - Layer 3: feedback-learned weights
+ * @param {Object} [opts]
+ *   priorMix: prior blend factor (default 0.3) — higher = more conservative
+ *   varianceThreshold: min variance to keep agent active (default 0.001)
+ * @returns {Object} Final normalized weights
+ */
+export function resolveAgentWeights(priorWeights, agentScoreMatrix = null, learnedWeights = null, opts = {}) {
+  const priorMix = opts.priorMix ?? 0.3;
+  const varianceThreshold = opts.varianceThreshold ?? 0.001;
+
+  // Layer 2: calibrate prior with discriminability if matrix provided
+  const calibrated = agentScoreMatrix && agentScoreMatrix.length >= 2
+    ? computeDynamicWeights(agentScoreMatrix, priorWeights, varianceThreshold)
+    : { ...priorWeights };
+
+  // Layer 3: blend with learned weights if available
+  if (!learnedWeights || Object.keys(learnedWeights).length === 0) {
+    return calibrated;
+  }
+
+  const agentNames = Object.keys(calibrated);
+  const blended = {};
+  for (const name of agentNames) {
+    const prior = calibrated[name] ?? 1 / agentNames.length;
+    const learned = learnedWeights[name] ?? prior;
+    blended[name] = prior * priorMix + learned * (1 - priorMix);
+  }
+
+  // Normalize to sum=1
+  const total = Object.values(blended).reduce((s, w) => s + w, 0);
+  const normalized = {};
+  for (const name of agentNames) {
+    normalized[name] = total > 0 ? Math.round((blended[name] / total) * 1000) / 1000 : 1 / agentNames.length;
+  }
+  return normalized;
+}
