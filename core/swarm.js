@@ -884,7 +884,16 @@ const _FALLBACK_AGENT_FRAMES = [
   { name: 'depth_preference',  motivation_frame: 'Does this match the depth and complexity this user tends to prefer?',       weight: 0.15 },
 ];
 
-function _buildStaticFleet(domain) {
+function _buildStaticFleet(domain, kgSummary = null) {
+  // Extract basic interest keywords from kgSummary so static agents aren't entirely blind
+  const interestAnchors = kgSummary
+    ? [
+        ...(kgSummary.interests || []),
+        ...(kgSummary.top_genres || []),
+        ...(kgSummary.preferred_topics || []),
+      ].map(s => String(s).toLowerCase()).filter(Boolean).slice(0, 10)
+    : [];
+
   const specs = _FALLBACK_AGENT_FRAMES.map(frame => ({
     name: frame.name,
     weight: frame.weight,
@@ -892,6 +901,7 @@ function _buildStaticFleet(domain) {
     screening_question: frame.motivation_frame,
     scoreFn: _buildSpecScorer({
       name: frame.name,
+      interest_anchors: interestAnchors,
       boost_keywords: [],
       penalty_keywords: [],
       domain_signals: {},
@@ -900,7 +910,32 @@ function _buildStaticFleet(domain) {
     isStatic: true,
   }));
 
-  return { agents: specs, weights: Object.fromEntries(specs.map(s => [s.name, s.weight])), source: 'static_fallback', domain };
+  const fleet = {
+    agents: specs,
+    weights: Object.fromEntries(specs.map(s => [s.name, s.weight])),
+    source: 'static_fallback',
+    domain,
+    scoreStory(story, ctx) {
+      let composite = 0;
+      const agentScores = {};
+      const allReasons = [];
+      for (const agent of this.agents) {
+        const result = agent.scoreFn(story, ctx || {});
+        agentScores[agent.name] = result.score;
+        composite += result.score * agent.weight;
+        for (const r of result.reasons) allReasons.push({ agent: agent.name, reason: r });
+      }
+      return {
+        score: Math.round(composite * 1000) / 1000,
+        agentScores,
+        reasons: allReasons,
+        story: { title: story.title, topics: story.topics },
+        fleetSource: this.source,
+      };
+    },
+  };
+
+  return fleet;
 }
 
 /**
@@ -1006,7 +1041,7 @@ export async function generateAgentFleet(domain, contentSample, kgSummary, llm =
     };
   } catch (err) {
     console.warn('[generateAgentFleet] LLM generation failed, using static fallback:', err.message);
-    fleet = { ..._buildStaticFleet(domain) };
+    fleet = _buildStaticFleet(domain, kgSummary);
   }
 
   fleet.cacheKey = cacheKey;

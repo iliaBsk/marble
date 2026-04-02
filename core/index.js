@@ -57,7 +57,7 @@ export class Marblism {
     }
 
     // v1: Direct scoring
-    const scored = this.scorer.score(stories);
+    const scored = await this.scorer.score(stories);
     return this.arc.reorder(scored, this.count);
   }
 
