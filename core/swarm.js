@@ -372,28 +372,150 @@ export class Swarm {
 
 export { Clone, SwarmAgent, AGENT_LENSES };
 
+// ── Genre Overlap Helpers ─────────────────────────────────────────────────────
+
 /**
- * Synchronous single-story scorer — runs all agent lenses and returns weighted consensus.
+ * Extract normalized genre array from a story regardless of field name.
+ * Handles: story.genres (array), story.genre (string/array), story.topics (array).
+ */
+function _normalizeGenres(story) {
+  const raw = story.genres || story.genre || [];
+  const arr = Array.isArray(raw) ? raw : (typeof raw === 'string' ? raw.split('|').map(s => s.trim()) : []);
+  // Also fold in topics that look like genres (no spaces, capitalized)
+  const topics = (story.topics || []).filter(t => /^[A-Z][a-z]+$/.test(t));
+  return [...new Set([...arr, ...topics])].map(g => g.toLowerCase()).filter(Boolean);
+}
+
+/**
+ * Build a genre → affinity weight map from user history and declared interests.
+ * Liked items contribute +0.3 per genre, disliked -0.1; interests add a base of 0.2.
+ * Returns weights normalized to [0, 1].
+ */
+function _buildGenreWeights(history, interests) {
+  const weights = {};
+
+  // Seed from declared interests
+  for (const [topic, data] of Object.entries(interests || {})) {
+    const w = typeof data === 'object' ? (data.weight || 0.5) : Number(data);
+    weights[topic.toLowerCase()] = (weights[topic.toLowerCase()] || 0) + w * 0.3;
+  }
+
+  // Learn from history
+  for (const item of (history || [])) {
+    const liked = item.reaction === 'liked' || item.score > 0.6;
+    const disliked = item.reaction === 'disliked' || item.score < 0.3;
+    if (!liked && !disliked) continue;
+    const genres = _normalizeGenres(item);
+    for (const g of genres) {
+      weights[g] = (weights[g] || 0) + (liked ? 0.3 : -0.1);
+    }
+  }
+
+  // Clamp to [0.05, 1.0]
+  for (const k of Object.keys(weights)) {
+    weights[k] = Math.max(0.05, Math.min(1.0, weights[k]));
+  }
+  return weights;
+}
+
+/**
+ * Compute genre overlap score: average genre affinity across a story's genres.
+ * Returns 0 if story has no genre data.
+ */
+export function genreOverlapScore(story, kg) {
+  const storyGenres = _normalizeGenres(story);
+  if (storyGenres.length === 0) return 0;
+
+  const clone = new Clone(kg);
+  clone.takeSnapshot();
+  const userInterests = clone._snapshot?.interests || {};
+  const history = kg.history || kg.reactions || [];
+
+  const weights = _buildGenreWeights(history, userInterests);
+  const scores = storyGenres.map(g => weights[g] || 0.05);
+  return scores.reduce((s, v) => s + v, 0) / scores.length;
+}
+
+/**
+ * Hybrid swarm score: genre overlap (60%) + motivation-grounded fallback agents (40%).
+ * Beats a pure genre baseline by layering user motivation signals on top of genre fit.
+ *
+ * For content without structured genres (news, articles), reverts to pure motivation agents.
+ *
  * @param {Object} story
  * @param {Object} kg - Knowledge graph / user clone
- * @returns {{ score: number, agentScores: Object }}
+ * @returns {{ score: number, agentScores: Object, genreScore: number, motivationScore: number }}
  */
 export function swarmScore(story, kg) {
   const clone = new Clone(kg);
   clone.takeSnapshot();
-  const agents = Object.entries(AGENT_LENSES).map(([, lens]) => new SwarmAgent(lens, clone));
+
+  // ── Motivation agents (fallback frames: domain-agnostic) ─────────────
+  const agents = _FALLBACK_AGENT_FRAMES.map(frame => ({
+    frame,
+    clone,
+  }));
+
   const agentScores = {};
   let weighted = 0;
   let totalWeight = 0;
-  for (const agent of agents) {
-    agent.evaluate([story]);
-    const s = agent.picks[0]?.score ?? 0;
-    const w = agent.lens.weight ?? 1;
-    agentScores[agent.lens.name ?? agent.lens.role] = s;
-    weighted += s * w;
-    totalWeight += w;
+
+  for (const { frame } of agents) {
+    // Score via clone engagement signal (domain-agnostic)
+    const baseEngagement = clone.wouldEngage ? clone.wouldEngage(story) : 0.3;
+
+    // Genre affinity boost for this agent's interest_anchors concept
+    const storyGenres = _normalizeGenres(story);
+    const interests = clone._snapshot?.interests || {};
+    const interestTopics = Object.keys(interests).map(t => t.toLowerCase());
+    const genreMatch = storyGenres.some(g => interestTopics.includes(g)) ? 0.2 : 0;
+
+    // Avoidance penalty
+    const avoidPatterns = (clone._snapshot?.avoid_patterns || clone._snapshot?.avoidPatterns || [])
+      .map(p => p.toLowerCase());
+    const titleText = `${story.title || ''} ${story.summary || ''}`.toLowerCase();
+    const avoided = avoidPatterns.some(p => titleText.includes(p)) ? -0.15 : 0;
+
+    // Depth preference: some frames prefer longer/shorter content
+    let depthBonus = 0;
+    if (frame.name === 'depth_preference') {
+      const wordCount = (story.summary || story.description || '').split(/\s+/).length;
+      const prefersDeep = (clone._snapshot?.preferences?.depth || 'medium') === 'deep';
+      depthBonus = prefersDeep ? (wordCount > 150 ? 0.15 : -0.05) : (wordCount < 80 ? 0.1 : 0);
+    }
+
+    const s = Math.max(0, Math.min(1, baseEngagement + genreMatch + avoided + depthBonus));
+    agentScores[frame.name] = s;
+    weighted += s * frame.weight;
+    totalWeight += frame.weight;
   }
-  return { score: totalWeight > 0 ? weighted / totalWeight : 0, agentScores };
+
+  const motivationScore = totalWeight > 0 ? weighted / totalWeight : 0;
+
+  // ── Genre overlap signal ─────────────────────────────────────────────
+  const storyGenres = _normalizeGenres(story);
+  const hasStructuredGenres = storyGenres.length > 0;
+  let genreScore = 0;
+
+  if (hasStructuredGenres) {
+    const userInterests = clone._snapshot?.interests || {};
+    const history = kg.history || kg.reactions || [];
+    const weights = _buildGenreWeights(history, userInterests);
+    const scores = storyGenres.map(g => weights[g] || 0.05);
+    genreScore = scores.reduce((s, v) => s + v, 0) / scores.length;
+  }
+
+  // ── Hybrid blend: genre takes majority when genres are available ──────
+  const score = hasStructuredGenres
+    ? genreScore * 0.6 + motivationScore * 0.4
+    : motivationScore;
+
+  return {
+    score: Math.round(score * 1000) / 1000,
+    agentScores,
+    genreScore: Math.round(genreScore * 1000) / 1000,
+    motivationScore: Math.round(motivationScore * 1000) / 1000,
+  };
 }
 
 // ── Dynamic Weights ──────────────────────────────────────────────────────────
@@ -544,20 +666,61 @@ function _hashKgSummary(kgSummary) {
 
 /**
  * Build a synchronous scorer from a generated agent spec.
- * Spec fields: name, boost_keywords, penalty_keywords, domain_signals, insight_keywords, interest_topics
+ * Spec fields: name, boost_keywords, penalty_keywords, domain_signals, insight_keywords,
+ *              interest_anchors, interest_topics, positive_signals, negative_signals
+ *
+ * Checks BOTH text content AND structured fields (story.genres, story.year, story.director)
+ * so the scorer works on sparse content like MovieLens items (title + genres only).
  */
 function _buildSpecScorer(spec) {
   return function specScorer(story, ctx) {
     let score = 0;
     const reasons = [];
-    const text = `${story.title || ''} ${story.summary || ''}`.toLowerCase();
+    const text = `${story.title || ''} ${story.summary || ''} ${story.description || ''}`.toLowerCase();
 
+    // ── Structured field matching (critical for sparse content like movies) ──
+    const storyGenres = _normalizeGenres(story);
+
+    // Interest anchors against story genres — genre is the primary signal for movies
+    const anchors = [
+      ...(spec.interest_anchors || []),
+      ...(spec.interest_topics || []),
+      ...(spec.positive_signals || []),
+    ].map(a => a.toLowerCase());
+
+    for (const anchor of anchors) {
+      if (storyGenres.includes(anchor)) {
+        score += 0.25;
+        reasons.push(`[${spec.name}] genre match: "${anchor}"`);
+        break;
+      }
+    }
+
+    // Story year / recency signal
+    const storyYear = story.year || (story.title ? (story.title.match(/\((\d{4})\)/) || [])[1] : null);
+    if (storyYear && spec.year_preference) {
+      const diff = Math.abs(Number(storyYear) - Number(spec.year_preference));
+      if (diff <= 5) { score += 0.15; reasons.push(`[${spec.name}] year match: ${storyYear}`); }
+    }
+
+    // ── Text keyword matching ─────────────────────────────────────────────
     for (const kw of (spec.boost_keywords || [])) {
       if (text.includes(kw.toLowerCase())) { score += 0.2; reasons.push(`[${spec.name}] boost: "${kw}"`); break; }
     }
     for (const kw of (spec.penalty_keywords || [])) {
       if (text.includes(kw.toLowerCase())) { score -= 0.1; reasons.push(`[${spec.name}] penalty: "${kw}"`); break; }
     }
+
+    // Negative signals vs genres
+    const negativeSignals = (spec.negative_signals || spec.penalty_keywords || []).map(s => s.toLowerCase());
+    for (const neg of negativeSignals) {
+      if (storyGenres.includes(neg)) {
+        score -= 0.15;
+        reasons.push(`[${spec.name}] genre penalty: "${neg}"`);
+        break;
+      }
+    }
+
     const domainSignals = (spec.domain_signals || {})[ctx._domain] || [];
     for (const sig of domainSignals) {
       if (text.includes(sig.toLowerCase())) { score += 0.15; reasons.push(`[${spec.name}] domain signal: "${sig}"`); break; }
