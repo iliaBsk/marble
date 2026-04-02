@@ -10,10 +10,10 @@
  * - precision@10 > 0.15 (beats random baseline of 0.125)
  */
 
-import { KnowledgeGraph } from './kg.js';
-import { Scorer } from './scorer.js';
-import { QuestionEngine } from './question-engine.js';
-import { extractEntityAttributes, attributeCount } from './entity-extractor.js';
+import { KnowledgeGraph } from '../core/kg.js';
+import { Scorer } from '../core/scorer.js';
+import { QuestionEngine } from '../core/question-engine.js';
+import { extractEntityAttributes, attributeCount } from '../core/entity-extractor.js';
 
 // ── Test Helpers ──────────────────────────────────────
 

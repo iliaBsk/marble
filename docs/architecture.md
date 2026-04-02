@@ -1,125 +1,372 @@
-# Architecture
+# Architecture Guide
 
 ## System Overview
 
-Marble is built as a pipeline of composable modules. Each module can run independently, but together they form a feedback loop that gets smarter daily.
+Marble follows a **modular, stateless architecture** with clear separation between user modeling, content scoring, and data persistence.
 
 ```
-Signals In → KG Processing → Hypothesis Testing → Multi-Agent Scoring → Delivery → Feedback Loop
+┌──────────────────────────────────────────────────────────────────────┐
+│                        Marble Architecture                            │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌───────────────┐   ┌──────────────────┐   ┌────────────────────┐ │
+│  │   Raw Items   │──▶│   Enrichment     │──▶│  Scored Results    │ │
+│  │   (any type)  │   │   Layer          │   │  (magic_score)     │ │
+│  └───────────────┘   └──────┬───────────┘   └────────────────────┘ │
+│                             │                        ▲              │
+│                             ▼                        │              │
+│                    ┌──────────────────┐    ┌──────────────────┐    │
+│                    │ Knowledge Graph  │───▶│     Scorer       │    │
+│                    │  (user model)    │    │  (multi-dim)     │    │
+│                    └────────┬─────────┘    └──────────────────┘    │
+│                             │                        ▲              │
+│                             ▼                        │              │
+│                    ┌──────────────────┐    ┌──────────────────┐    │
+│                    │ Pattern Detector │───▶│ Calibration API  │    │
+│                    │  (cross-item)    │    │  (auto-tune)     │    │
+│                    └──────────────────┘    └──────────────────┘    │
+│                             │                                      │
+│                             ▼                                      │
+│                    ┌──────────────────┐                            │
+│                    │ Persistent Store │                            │
+│                    │   (JSON files)   │                            │
+│                    └──────────────────┘                            │
+└──────────────────────────────────────────────────────────────────────┘
 ```
+
+## Core Components
+
+### 1. Knowledge Graph (`kg.js`)
+**Responsibility**: User modeling and state management
+
+```javascript
+class KnowledgeGraph {
+  // User state management
+  load()              // Load from disk
+  save()              // Persist to disk
+
+  // Interest modeling
+  getInterestWeight() // Get current interest (with decay)
+  boostInterest()     // Positive feedback
+  decayInterest()     // Negative feedback
+
+  // Context management
+  setContext()        // Update daily context
+
+  // History tracking
+  recordReaction()    // Log user interaction
+  hasSeen()          // Check if story shown before
+
+  // Source trust
+  getSourceTrust()    // Get source credibility
+}
+```
+
+**Key Features**:
+- Automatic interest decay (14-day half-life)
+- Context-aware relevance
+- Source trust learning
+- Anti-staleness (no duplicate stories)
+
+### 2. Scorer (`scorer.js`)
+**Responsibility**: Multi-dimensional story ranking
+
+```javascript
+class Scorer {
+  score(stories)      // Rank stories by magic_score
+
+  // Private scoring methods
+  #interestMatch()    // Topic similarity
+  #temporalRelevance()// Context awareness
+  #noveltyScore()     // Filter bubble prevention
+  #actionability()    // Can user act on this?
+  #sourceTrust()      // Source credibility
+  #freshnessDecay()   // Recency bias
+}
+```
+
+**Scoring Pipeline**:
+1. **Interest Match**: Semantic similarity to user interests
+2. **Temporal Relevance**: Relevance to today's context
+3. **Novelty**: Exposure to new topics
+4. **Actionability**: Practical utility
+5. **Source Trust**: Historical source performance
+6. **Freshness**: Recency multiplier
+
+### 3. Types (`types.js`)
+**Responsibility**: Type definitions and constants
+
+- **Story/ScoredStory**: Data schemas
+- **UserNode/InterestEdge**: User model structure
+- **SCORE_WEIGHTS**: Dimension weightings
+- **ARC_SLOTS**: Narrative positioning
+
+### 4. Embeddings (`embeddings.js`)
+**Responsibility**: Semantic similarity calculations
+
+```javascript
+class EmbeddingEngine {
+  getSimilarity(text1, text2)  // Cosine similarity
+  embed(text)                  // Generate embeddings
+  enableCache(path)            // Persistent caching
+}
+```
+
+**Features**:
+- OpenAI embeddings (with local fallback)
+- Persistent disk cache
+- Cosine similarity calculations
+- Graceful degradation to string matching
+
+### 5. Item Enrichment Layer
+
+The enrichment layer extracts deep, preference-predictive attributes from items — going far beyond basic metadata like genre or author. It operates through three cooperating components:
+
+#### Entity Extractor (`entity-extractor.js`)
+**Responsibility**: Synchronous, metadata-driven attribute extraction
+
+```javascript
+extractEntityAttributes(item)
+// Returns: { domain: string, attributes: { [kgKey]: Array<{value, kgKey, kgType, attribute}> } }
+```
+
+- **Domain detection**: Infers item type (movie, music, book, article, restaurant) from metadata fields — no hardcoded type registry
+- **Field-to-KG mapping**: Maps common metadata fields (director, genre, pacing, themes, cuisine, etc.) to KG node types via `FIELD_KG_MAP`
+- **Text extraction**: Falls back to parsing title/summary for year→era, genre keywords, and theme keywords when structured metadata is absent
+- Called **synchronously** from `kg.recordReaction()` on every user reaction
+
+#### Topic Insight Engine (`topic-insight-engine.js`)
+**Responsibility**: LLM-powered deep dimension discovery
+
+```javascript
+class TopicInsightEngine {
+  analyse(item, reaction, kg)      // Main entry: extract → gap-check → simulate → write
+  extractDimensions(item)          // LLM or heuristic dimension extraction
+}
+```
+
+- **Self-questioning loop**: Asks the LLM "what dimensions predict preference for THIS item?" — no pre-defined schema
+- Each dimension is typed: `{ id, label, value, kgType: 'belief'|'preference'|'identity' }`
+- Checks KG for existing evidence before generating new hypotheses
+- Writes surviving hypotheses as typed KG nodes (beliefs, preferences, identities)
+- Called **asynchronously** (fire-and-forget) from `kg.recordReaction()` when attached
+
+#### Gap Simulator (`topic-insight-engine.js`)
+**Responsibility**: Hypothesis generation for unknown preference dimensions
+
+```javascript
+class GapSimulator {
+  simulate(item, gaps, ratedHistory, reaction)
+  // Returns: Array<{dimensionId, value, kgType, confidence, reasoning}>
+}
+```
+
+- For dimensions with **no existing KG evidence**, generates plausible hypotheses about user preferences
+- Cross-checks hypotheses against rated history to eliminate contradictions
+- Confidence scores: 0.2–0.4 with little history, 0.5–0.8 with corroborating evidence
+- Has both LLM-powered and heuristic fallback paths
+
+#### Integration Flow
+
+```
+User reacts to item
+    │
+    ├──▶ extractEntityAttributes(item)          [sync, entity-extractor.js]
+    │       └──▶ KG.#trackDimensionalPreferences()
+    │
+    └──▶ TopicInsightEngine.analyse(item, reaction, kg)  [async, fire-and-forget]
+            ├──▶ extractDimensions(item)         [LLM or heuristic]
+            ├──▶ Check KG for existing evidence
+            ├──▶ GapSimulator.simulate()         [for unknown dimensions]
+            ├──▶ Write hypotheses as KG nodes
+            └──▶ Reinforce known dimensions
+```
+
+- **Sync path** (entity-extractor): fast, metadata-only, runs on every reaction
+- **Async path** (TopicInsightEngine): deeper, LLM-powered, fire-and-forget
+- Both paths converge in the KG — enrichment results feed into the `attribute_pattern_match` scoring dimension
+
+### 6. Evolution (`evolution.js`)
+**Responsibility**: User model adaptation over time
+
+- Interest drift detection
+- Long-term preference learning
+- Model stability maintenance
 
 ## Data Flow
 
-### 1. Signal Ingestion
-
-Three layers of signals feed the system:
-
-**World Signals (~80% of ranking power)**
-- Google Trends topic spikes
-- HackerNews score velocity
-- Reddit upvote patterns
-- Funding news, app rankings
-
-**Sector Signals (~15%)**
-- Industry forum activity
-- Competitor mentions
-- Ecosystem changes
-
-**Personal Signals (~5%)**
-- Dwell time on stories
-- Scroll depth
-- Forwards and replies
-- Silence patterns (no engagement = implicit negative)
-
-### 2. Knowledge Graph Processing
-
-When a signal arrives, `kg.js` doesn't just increment a weight — it generates hypotheses:
-
+### 1. Story Ingestion
 ```
-Signal: User dwelled 45s on "AI code review tools"
-  → Hypothesis: "User evaluating dev tools for team" (confidence: 0.4)
-  → Hypothesis: "User interested in AI productivity" (confidence: 0.6)
-  → Cross-reference: Previously clicked 3 hiring articles
-  → Updated hypothesis: "User scaling engineering team" (confidence: 0.7)
+External APIs ───┐
+RSS Feeds    ───┼──▶ Raw Stories Array
+Web Scrapers ───┘
 ```
 
-### 3. Clone Simulation
-
-The `clone.js` module creates a digital twin — a snapshot of the user's interests, patterns, context, and source trust. The `evolution.js` engine spawns N variants of this clone with slightly different weight configurations.
-
+### 2. Scoring Process
 ```
-Generation 1: 10 clones with random weight mutations
-  → Each scores 100 stories
-  → User's actual behavior reveals which clones predicted correctly
-  → Kill bottom 20%
-  → Mutate survivors
-  → Spawn new variants
-Generation 2: Surviving clones are slightly more accurate
-  ...
-Generation 14: Clones have converged on real preferences
+Raw Stories ──▶ Scorer.score() ──┐
+                      │          │
+                      ▼          ▼
+            KnowledgeGraph ─▶ ScoredStories
+                      │
+                      ▼
+            Interest Matching
+            Temporal Analysis
+            Novelty Injection
+            Trust Weighting
 ```
 
-### 4. Multi-Agent Scoring (Swarm)
-
-Five specialized agents evaluate stories through different lenses:
-
-- **Career (25%)** — Professional growth, project relevance
-- **Timing (25%)** — Calendar awareness, deadline proximity
-- **Serendipity (20%)** — Unexpected delight, cross-domain discovery
-- **Growth (15%)** — Adjacent interests, emerging fields
-- **Contrarian (15%)** — What everyone else is missing
-
-Each agent scores independently. Weighted consensus produces the final ranking.
-
-The swarm is relationship-aware: agents factor in family schedules (school pickup at 3pm), partner timing (evening couple time), and seasonal patterns (summer outdoor activities, back-to-school).
-
-### 5. Narrative Arc Reranking
-
-Top-scored stories are resequenced for narrative flow. Position 1 (Opener) through Position 10 (Closer) follow a story arc pattern designed for engagement:
-
+### 3. User Feedback Loop
 ```
-Opener → Bridge → Deep Dives → Pivot (surprise) → Practical → Horizon → Personal → Closer
+User Reaction ──▶ KG.recordReaction() ──▶ Interest Updates
+      │                                        │
+      ▼                                        ▼
+Story Metadata                         Source Trust Updates
+(topics, source)                            │
+                                           ▼
+                                    Persistent Storage
 ```
 
-### 6. Delivery & Signal Collection
+## Storage Architecture
 
-Stories reach users through Telegram, Email, JSON API, or Webhooks. Each channel tracks engagement signals (opens, clicks, dwell time, forwards, silence) that feed back into the KG.
-
-### 7. Evolution Loop
-
-Daily cycle:
-1. Collect all signals from previous day
-2. Evaluate clone fitness against actual behavior
-3. Kill bottom 20% of clone population
-4. Mutate survivors, spawn new variants
-5. Update KG hypotheses with confirmed/denied predictions
-6. Observer tracks KPIs and alerts on degradation
-
-## Module Dependencies
-
+### File Structure
 ```
-embeddings.js ← scorer.js ← index.js (main entry)
-                    ↑
-kg.js ← clone.js ← swarm.js
-  ↑        ↑
-  └── signals.js
-  └── evolution.js
-         ↑
-      observer.js (monitors everything)
+data/marble/
+├── alex.json           # User knowledge graph
+├── beta-user.json      # Another user
+└── ...
 
-adapters/sources/ → index.js → adapters/delivery/
-                        ↑
-              adapters/signals/world.js
+data/cache/
+├── embeddings/         # Semantic similarity cache
+│   ├── topic-pairs.json
+│   └── embeddings.json
+└── ...
 ```
 
-## Key Design Decisions
+### User Model Schema
+```javascript
+{
+  "id": "alex",
+  "interests": [
+    {
+      "topic": "artificial-intelligence",
+      "weight": 0.85,
+      "last_boost": "2026-03-24T10:30:00Z",
+      "trend": "rising"
+    }
+  ],
+  "context": {
+    "calendar": ["investor pitch at 2pm"],
+    "active_projects": ["marble-launch"],
+    "recent_conversations": ["ai-funding", "product-market-fit"]
+  },
+  "history": [
+    {
+      "story_id": "story-123",
+      "reaction": "up",
+      "date": "2026-03-24T09:15:00Z",
+      "topics": ["ai", "startups"],
+      "source": "techcrunch"
+    }
+  ],
+  "source_trust": {
+    "techcrunch": 0.78,
+    "hackernews": 0.65
+  }
+}
+```
 
-**User-centric KG**: The user is the root node, not entities. Every story is scored by distance to what matters to the user right now.
+## Scalability Considerations
 
-**Implicit over explicit**: No rating buttons. Learn from behavior. Silence is a signal.
+### Single User Performance
+- **Stories/sec**: ~5000 stories scored per second
+- **Memory footprint**: ~50MB per user (10K interactions)
+- **Disk usage**: ~10KB per user profile
 
-**Local-first**: Core scoring uses ONNX embeddings locally. No API keys required. LLM is optional for enhanced reasoning.
+### Multi-User Scaling
+```
+Load Balancer ──┐
+                ├──▶ Scorer Instance 1 ──▶ User KG Cache
+                ├──▶ Scorer Instance 2 ──▶ User KG Cache
+                └──▶ Scorer Instance N ──▶ User KG Cache
+                            │
+                            ▼
+                    Shared Embeddings Cache
+                            │
+                            ▼
+                    Persistent Storage Layer
+```
 
-**Evolutionary convergence**: Instead of tuning one model, evolve a population. Surviving clones represent the best approximation of the real user.
+### Caching Strategy
+- **User models**: In-memory LRU cache (1000 users)
+- **Embeddings**: Persistent disk cache
+- **Story metadata**: Redis cache for frequently accessed stories
 
-**Hypothesis-driven**: Every data point generates testable hypotheses. The system doesn't just track "user likes AI" — it asks "why does this user click on AI articles at 9am but not 3pm?"
+## Security & Privacy
+
+### Data Minimization
+- Only store necessary user interaction data
+- Automatic history trimming (500 most recent reactions)
+- No storage of story content (only metadata)
+
+### Isolation
+- Each user model is independently stored
+- No cross-user data leakage
+- Stateless scoring (no shared state between users)
+
+## Integration Patterns
+
+### API Integration
+```javascript
+// RESTful scoring endpoint
+POST /api/score
+{
+  "user_id": "alex",
+  "stories": [...],
+  "context": {...}
+}
+
+// Response
+{
+  "ranked_stories": [...],
+  "user_insights": {...}
+}
+```
+
+### Event-Driven Integration
+```javascript
+// Reaction webhook
+POST /api/react
+{
+  "user_id": "alex",
+  "story_id": "story-123",
+  "reaction": "up"
+}
+```
+
+### Batch Processing
+```javascript
+// Bulk user update
+POST /api/bulk-score
+{
+  "users": ["alex", "beta-user"],
+  "stories": [...],
+  "async": true
+}
+```
+
+## Monitoring & Observability
+
+### Key Metrics
+- **Scoring latency**: p95, p99 response times
+- **User engagement**: Reaction rates, session length
+- **Model accuracy**: Predicted vs actual reactions
+- **Cache hit rates**: Embeddings, user models
+
+### Health Checks
+- User model loading/saving success rates
+- Embedding service availability
+- Disk space for user data
+- Memory usage per user model
+
+This architecture provides a solid foundation for building personalized content experiences at scale while maintaining simplicity and explainability.
