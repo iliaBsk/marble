@@ -226,8 +226,7 @@ class LightweightMarbleScorer {
         source_trust: this.computeSourceTrust(story)
       };
     } catch (error) {
-      console.warn('Semantic scoring error:', error.message);
-      return this.keywordMatcher.score(story, userInterests);
+      throw new Error(`Semantic scoring failed (no keyword fallback): ${error.message}`);
     }
   }
 

@@ -18,7 +18,7 @@
  */
 class OpenAIEmbeddings {
   constructor(options = {}) {
-    this.apiKey = options.apiKey || process.env.OPENAI_API_KEY;
+    this.apiKey = (options.apiKey !== undefined && options.apiKey !== null) ? options.apiKey : process.env.OPENAI_API_KEY;
     this.model = options.model || process.env.OPENAI_EMBEDDING_MODEL || 'text-embedding-3-small';
     this.baseUrl = options.baseUrl || 'https://api.openai.com/v1';
 

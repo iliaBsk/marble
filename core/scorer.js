@@ -716,14 +716,7 @@ export class Scorer {
       return max * 0.8; // Slightly lower for non-semantic matches
 
     } catch (error) {
-      console.warn('Semantic matching failed, using fallback:', error.message);
-      // Fallback to original keyword-based matching
-      const weights = story.topics.map(t => this.kg?.getInterestWeight?.(t) || 0);
-      if (weights.every(w => w === 0)) return 0.1;
-      const max = Math.max(...weights);
-      const matchCount = weights.filter(w => w > 0).length;
-      const multiBonus = Math.min(0.1, matchCount * 0.03);
-      return Math.min(1, max + multiBonus);
+      throw new Error(`Semantic matching failed (no keyword fallback): ${error.message}`);
     }
   }
 
