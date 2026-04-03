@@ -298,15 +298,15 @@ export class Swarm {
       const response = await this.options.llm(prompt);
 
       try {
-        // Fail loud: if LLM returns fenced JSON, the prompt is misbehaving — skip agent, do not silently fix
+        // Warn + skip: if LLM returns fenced JSON, the prompt is misbehaving — skip this agent
         if (String(response).includes('```')) {
-          console.warn(`[Swarm] ${agent.lens.name}: LLM returned fenced JSON (prompt misbehaving) — skipping agent (score 0). Raw: ${String(response).slice(0, 300)}`);
-          return;
+          console.warn(`[Swarm] PARSE SKIP — ${agent.lens.name}: LLM returned fenced JSON (prompt misbehaving). Agent contributes score 0. Raw: ${String(response).slice(0, 300)}`);
+          return; // skip this agent, continue with remaining agents
         }
         const parsed = JSON.parse(response.trim());
         if (!parsed.picks || !Array.isArray(parsed.picks)) {
-          console.warn(`[Swarm] ${agent.lens.name}: parsed response missing 'picks' array — skipping agent (score 0)`);
-          return;
+          console.warn(`[Swarm] PARSE SKIP — ${agent.lens.name}: parsed response missing 'picks' array. Agent contributes score 0.`);
+          return; // skip this agent, continue with remaining agents
         }
         for (const pick of parsed.picks || []) {
           const story = stories[pick.index - 1];
@@ -319,10 +319,9 @@ export class Swarm {
           }
         }
       } catch (err) {
-        console.warn(`[Swarm] ${agent.lens.name}: failed to parse LLM response — skipping agent (score 0). Error: ${err.message}`);
-        console.warn(`[Swarm] ${agent.lens.name}: raw response was: ${String(response).slice(0, 300)}`);
-        // Do NOT fall back to heuristics. This agent contributes score 0.
-        // Remaining agents continue normally.
+        console.warn(`[Swarm] PARSE SKIP — ${agent.lens.name}: failed to parse LLM response — contributing score 0. Error: ${err.message}`);
+        console.warn(`[Swarm] PARSE SKIP — ${agent.lens.name}: raw response snippet: ${String(response).slice(0, 300)}`);
+        // Do NOT throw — skip this agent's contribution and continue with remaining agents
       }
     });
 
@@ -1143,9 +1142,9 @@ Return ONLY a plain JSON array — no code fences, no markdown, no explanation b
       };
     });
   } catch (err) {
-    console.warn(`[Marble] ${agentName}: failed to parse LLM response — skipping agent (score 0). Error: ${err.message}`);
-    console.warn(`[Marble] ${agentName}: prompt may be returning fenced or malformed JSON — check LLM response format`);
-    // Do NOT fall back to heuristics. This agent contributes score 0.
+    console.warn(`[Swarm] PARSE SKIP — ${agentName}: failed to parse LLM response — contributing score 0. Error: ${err.message}`);
+    console.warn(`[Swarm] PARSE SKIP — ${agentName}: prompt may be returning fenced or malformed JSON — check LLM response format`);
+    // Do NOT throw — skip this agent's contribution and continue with remaining agents
     return { agent: agentName, questions: [], score: 0, questionsWithData: 0, source: 'parse_failed' };
   }
 
