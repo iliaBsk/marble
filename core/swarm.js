@@ -298,9 +298,12 @@ export class Swarm {
       const response = await this.options.llm(prompt);
 
       try {
-        // Strip code fences if present (should not happen — prompt forbids them, but guard anyway)
-        const clean = response.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
-        const parsed = JSON.parse(clean);
+        // Fail loud: if LLM returns fenced JSON, the prompt is misbehaving — skip agent, do not silently fix
+        if (String(response).includes('```')) {
+          console.warn(`[Swarm] ${agent.lens.name}: LLM returned fenced JSON (prompt misbehaving) — skipping agent (score 0). Raw: ${String(response).slice(0, 300)}`);
+          return;
+        }
+        const parsed = JSON.parse(response.trim());
         if (!parsed.picks || !Array.isArray(parsed.picks)) {
           console.warn(`[Swarm] ${agent.lens.name}: parsed response missing 'picks' array — skipping agent (score 0)`);
           return;
