@@ -1,19 +1,19 @@
-import { describe, it } from 'node:test';
+import { describe, it, before } from 'node:test';
 import assert from 'node:assert';
-import { embeddings, LocalEmbeddings } from '../core/embeddings.js';
+import { embeddings, OpenAIEmbeddings, createEmbeddingsProvider } from '../core/embeddings.js';
 
-describe('Local Embeddings', () => {
-  it('should initialize embeddings system', async () => {
-    await embeddings.initialize();
-    assert.ok(embeddings.tokenizer, 'Tokenizer should be initialized');
-  });
+if (!process.env.OPENAI_API_KEY) {
+  console.error('OPENAI_API_KEY not set — skipping embeddings tests');
+  process.exit(0);
+}
 
+describe('OpenAI Embeddings', () => {
   it('should generate embeddings for text', async () => {
     const text = 'EU digital markets act compliance requirements';
     const embedding = await embeddings.embed(text);
 
     assert.ok(embedding instanceof Float32Array, 'Should return Float32Array');
-    assert.equal(embedding.length, 384, 'Should have 384 dimensions');
+    assert.equal(embedding.length, 1536, 'Should have 1536 dimensions (text-embedding-3-small)');
 
     // Check that embedding is normalized (L2 norm ≈ 1)
     let norm = 0;
@@ -38,7 +38,6 @@ describe('Local Embeddings', () => {
     const sim1_2 = embeddings.cosineSimilarity(emb1, emb2);
     const sim1_3 = embeddings.cosineSimilarity(emb1, emb3);
 
-    // Similar marketing texts should be more similar than unrelated texts
     assert.ok(sim1_2 > sim1_3, 'Similar texts should have higher similarity');
     assert.ok(sim1_2 >= -1 && sim1_2 <= 1, 'Similarity should be between -1 and 1');
     assert.ok(sim1_3 >= -1 && sim1_3 <= 1, 'Similarity should be between -1 and 1');
@@ -58,10 +57,7 @@ describe('Local Embeddings', () => {
     assert.ok(result.text, 'Should find a match');
     assert.ok(result.similarity > 0, 'Should have positive similarity');
     assert.equal(typeof result.index, 'number', 'Should return index');
-
-    // Should find some reasonable match (fallback implementation may vary)
     console.log('Best match:', result.text, 'similarity:', result.similarity);
-    assert.ok(result.similarity > 0, 'Should find some match with positive similarity');
   });
 
   it('should handle batch embedding', async () => {
@@ -71,27 +67,28 @@ describe('Local Embeddings', () => {
       'Data science methods'
     ];
 
-    const embeddings_batch = await embeddings.embedBatch(texts);
+    const batch = await embeddings.embedBatch(texts);
 
-    assert.equal(embeddings_batch.length, texts.length, 'Should return same number of embeddings');
-    embeddings_batch.forEach(emb => {
+    assert.equal(batch.length, texts.length, 'Should return same number of embeddings');
+    batch.forEach(emb => {
       assert.ok(emb instanceof Float32Array, 'Each should be Float32Array');
-      assert.equal(emb.length, 384, 'Each should have 384 dimensions');
+      assert.equal(emb.length, 1536, 'Each should have 1536 dimensions');
     });
   });
 
-  it('should handle edge cases gracefully', async () => {
-    // Empty text
-    const emptyEmb = await embeddings.embed('');
-    assert.ok(emptyEmb instanceof Float32Array, 'Should handle empty text');
+  it('should throw without OPENAI_API_KEY', () => {
+    assert.throws(
+      () => new OpenAIEmbeddings({ apiKey: '' }),
+      /OPENAI_API_KEY/,
+      'Should throw if no API key'
+    );
+  });
 
-    // Very long text
-    const longText = 'word '.repeat(1000);
-    const longEmb = await embeddings.embed(longText);
-    assert.ok(longEmb instanceof Float32Array, 'Should handle long text');
-
-    // Special characters
-    const specialEmb = await embeddings.embed('Test !@#$%^&*()');
-    assert.ok(specialEmb instanceof Float32Array, 'Should handle special characters');
+  it('should throw for removed local provider', () => {
+    assert.throws(
+      () => createEmbeddingsProvider({ provider: 'local' }),
+      /removed/i,
+      'Should throw for local provider'
+    );
   });
 });

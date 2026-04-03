@@ -83,9 +83,7 @@ class LightweightMarbleScorer {
       await this.embeddings.initialize();
       console.log('✓ Embeddings loaded successfully');
     } catch (error) {
-      console.warn('Failed to load embeddings, using keyword fallback:', error.message);
-      this.embeddings = null;
-      this.options.enableEmbeddings = false;
+      throw new Error(`Failed to load embeddings: ${error.message}`);
     }
 
     return this.embeddings;
