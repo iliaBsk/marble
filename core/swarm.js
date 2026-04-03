@@ -866,9 +866,11 @@ Rules:
   });
 
   const raw = response.content[0]?.type === 'text' ? response.content[0].text : '';
-  const jsonMatch = raw.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new Error('No JSON object found in LLM response');
-  const parsed = JSON.parse(jsonMatch[0]);
+  // Fail loud: if LLM returns fenced JSON, the prompt is misbehaving — do not silently extract
+  if (raw.includes('```')) {
+    throw new Error(`LLM returned fenced JSON (prompt misbehaving). Check _generateFleetFromLLM prompt. Raw: ${raw.slice(0, 200)}`);
+  }
+  const parsed = JSON.parse(raw.trim());
   if (!Array.isArray(parsed.agents) || parsed.agents.length === 0) throw new Error('Invalid agents array');
 
   // Attach inferred motivation metadata to each agent spec for use by explodeAgentQuestions
@@ -1118,10 +1120,13 @@ Return ONLY a plain JSON array — no code fences, no markdown, no explanation b
     });
 
     const raw = response.content[0]?.type === 'text' ? response.content[0].text : '';
-    const jsonMatch = raw.match(/\[[\s\S]*\]/);
-    if (!jsonMatch) throw new Error('No JSON array in LLM response');
-
-    const parsed = JSON.parse(jsonMatch[0]);
+    // Fail loud: if LLM returns fenced JSON, the prompt is misbehaving — skip agent, do not silently extract
+    if (raw.includes('```')) {
+      console.warn(`[Marble] ${agentName}: LLM returned fenced JSON (prompt misbehaving) — skipping agent (score 0). Raw: ${raw.slice(0, 300)}`);
+      console.warn(`[Marble] ${agentName}: Check explodeAgentQuestions prompt — it must say "no code fences, no markdown"`);
+      return { agent: agentName, questions: [], score: 0, questionsWithData: 0, source: 'fenced_response' };
+    }
+    const parsed = JSON.parse(raw.trim());
     if (!Array.isArray(parsed)) throw new Error('LLM response is not an array');
 
     questions = parsed.slice(0, n).map(q => {
@@ -1589,7 +1594,7 @@ Rules:
 Return a JSON array of up to 5 objects:
 [{"question": "...", "rationale": "...", "source_hint": "..."}]
 
-Return ONLY the JSON array, no preamble.`;
+Return ONLY a plain JSON array — no code fences, no markdown, no explanation before or after.`;
 
   try {
     const response = await client.messages.create({
@@ -1741,7 +1746,7 @@ Rules:
 - false: question has no web-findable answer (internal user history, rating patterns, watch habits)
 - false: domain is news/politics/opinion and question is about user stance
 
-Return ONLY the JSON, no preamble.`;
+Return ONLY a plain JSON object — no code fences, no markdown, no explanation before or after.`;
 
   try {
     const response = await client.messages.create({
