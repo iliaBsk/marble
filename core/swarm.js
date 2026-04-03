@@ -830,7 +830,7 @@ ${kgStr}
 Content domain: ${domain}
 Content sample: ${(contentSample || '').slice(0, 300)}
 
-Return ONLY a JSON object:
+Return ONLY a plain JSON object — no code fences, no markdown, no explanation before or after:
 {
   "inferred_motivation": "one sentence — why this user consumes this content type",
   "motivation_signals": ["evidence from KG that supports this", ...],
@@ -1098,7 +1098,7 @@ For each question, evaluate it against the content and provide:
 - confidence: 0.0–1.0 certainty about the fired value (based on evidence in the content)
 - evidence: a short quote or specific observation from the content justifying fired. Required — if you cannot cite evidence, set confidence to 0.3 or below.
 
-Return ONLY a JSON array, no commentary:
+Return ONLY a plain JSON array — no code fences, no markdown, no explanation before or after:
 [
   { "question": "...", "fired": true/false, "confidence": 0.0-1.0, "evidence": "..." },
   ...
@@ -1135,22 +1135,10 @@ Return ONLY a JSON array, no commentary:
       };
     });
   } catch (err) {
-    source = 'fallback';
-    const text = (contentSample || '').toLowerCase();
-    const keywords = [
-      ...(agentSpec.boost_keywords || []),
-      ...(agentSpec.insight_keywords || []),
-    ].slice(0, n);
-
-    questions = keywords.map(kw => ({
-      question: `Does the content relate to "${kw}"?`,
-      fired: text.includes(kw.toLowerCase()),
-      confidence: text.includes(kw.toLowerCase()) ? 0.7 : 0.2,
-    }));
-
-    while (questions.length < n) {
-      questions.push({ question: `Is this content relevant to the ${agentName} agent?`, fired: false, confidence: 0.1 });
-    }
+    console.warn(`[Marble] ${agentName}: failed to parse LLM response — skipping agent (score 0). Error: ${err.message}`);
+    console.warn(`[Marble] ${agentName}: prompt may be returning fenced or malformed JSON — check LLM response format`);
+    // Do NOT fall back to heuristics. This agent contributes score 0.
+    return { agent: agentName, questions: [], score: 0, questionsWithData: 0, source: 'parse_failed' };
   }
 
   const questionsWithData = questions.length;
