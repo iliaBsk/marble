@@ -469,7 +469,10 @@ export function swarmScore(story, kg, opts = {}) {
   let motivationScore;
   let agentScores = {};
 
-  const fleetResult = opts.fleet.scoreStory(story, {});
+  const fleetResult = opts.fleet.scoreStory(story, {
+    _resolvedContext: opts.resolvedContext || null,
+    _kg: kg,
+  });
   motivationScore = fleetResult.score;
   agentScores = fleetResult.agentScores || {};
 
@@ -932,6 +935,11 @@ export async function generateAgentFleet(domain, contentSample, kgSummary, llm =
           agentScores[agent.name] = result.score;
           composite += result.score * agent.weight;
           for (const r of result.reasons) allReasons.push({ agent: agent.name, reason: r });
+        }
+        // Apply resolvedContext adjustment: confirm match = boost, surface mismatch = reduce
+        if (ctx._resolvedContext && ctx._resolvedContext.length > 0) {
+          const adj = _resolvedContextAdjustment(ctx._resolvedContext, story, ctx._kg);
+          composite = Math.max(0, Math.min(1, composite + adj));
         }
         return {
           score: Math.round(composite * 1000) / 1000,
@@ -1629,4 +1637,355 @@ function _buildKgSummary(kg) {
     interests && `Interests: ${interests}`,
     hypotheses && `Hypotheses: ${hypotheses}`,
   ].filter(Boolean).join('\n');
+}
+
+// ─── RESOLVE PHASE HELPERS ───────────────────────────────────────────────────
+
+/**
+ * _webGateJudge — Lightweight LLM call to decide if web search would return
+ * user-specific personalized signal (vs generic public info).
+ */
+async function _webGateJudge(question, domain, llm) {
+  const client = llm || createLLMClient();
+  const prompt = `You decide whether a web search would produce USER-SPECIFIC personalized signal for a recommendation system.
+
+Domain: ${domain}
+Question: ${question}
+
+Respond with JSON: {"search": true/false, "reason": "one line"}
+
+Rules:
+- true: web search would return factual content metadata (cast, director, genre, release date, plot details, sequel status, awards)
+- true: web search would return comparable content (other films by same director, similar themes)
+- false: question is about user opinion, politics, ethics, personal preference ("do they like gun laws", "what is their view on X")
+- false: question has no web-findable answer (internal user history, rating patterns, watch habits)
+- false: domain is news/politics/opinion and question is about user stance
+
+Return ONLY the JSON, no preamble.`;
+
+  try {
+    const response = await client.messages.create({
+      model: process.env.MARBLE_LLM_MODEL || defaultModel('light'),
+      max_tokens: 100,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const raw = response.content[0]?.type === 'text' ? response.content[0].text : '{}';
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return false;
+    const parsed = JSON.parse(jsonMatch[0]);
+    return parsed.search === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * _resolveFromKG — Answer an investigation question using KG data.
+ */
+function _resolveFromKG(question, kg) {
+  if (!kg) return null;
+  const user = kg.user || kg;
+  const q = question.toLowerCase();
+
+  const history = user.history || [];
+  if (history.length > 0 && (q.includes('watch') || q.includes('rate') || q.includes('like') || q.includes('react'))) {
+    const recentReactions = history.slice(-20).map(h => `${h.storyId || h.id}: ${h.reaction || h.rating}`).join(', ');
+    if (recentReactions) return { answer: `Recent reactions: ${recentReactions}`, source: 'kg:history' };
+  }
+
+  const interests = user.interests || [];
+  if (interests.length > 0 && (q.includes('interest') || q.includes('topic') || q.includes('prefer'))) {
+    return { answer: `User interests: ${interests.slice(0, 8).join(', ')}`, source: 'kg:interests' };
+  }
+
+  const beliefs = user.beliefs || [];
+  if (beliefs.length > 0 && (q.includes('belief') || q.includes('value') || q.includes('opinion') || q.includes('view'))) {
+    const matched = beliefs.slice(0, 5).map(b => typeof b === 'string' ? b : (b.text || JSON.stringify(b))).join('; ');
+    if (matched) return { answer: `User beliefs: ${matched}`, source: 'kg:beliefs' };
+  }
+
+  const insights = user.insights || [];
+  if (insights.length > 0) {
+    const matched = insights.slice(0, 5).map(i => typeof i === 'string' ? i : (i.text || JSON.stringify(i))).join('; ');
+    if (matched) return { answer: `Insights: ${matched}`, source: 'kg:insights' };
+  }
+
+  const hypotheses = user.hypotheses || [];
+  if (hypotheses.length > 0 && (q.includes('hypothesis') || q.includes('pattern') || q.includes('tend'))) {
+    const matched = hypotheses.slice(0, 3).map(h => typeof h === 'string' ? h : (h.text || JSON.stringify(h))).join('; ');
+    if (matched) return { answer: `Hypotheses: ${matched}`, source: 'kg:hypotheses' };
+  }
+
+  return null;
+}
+
+/**
+ * _resolveFromMetadata — Answer an investigation question using story metadata.
+ */
+function _resolveFromMetadata(question, story) {
+  if (!story) return null;
+  const q = question.toLowerCase();
+  const parts = [];
+  if (q.includes('genre') && story.genre) parts.push(`Genre: ${story.genre}`);
+  if ((q.includes('direct') || q.includes('creat') || q.includes('author')) && story.author) parts.push(`Author/Director: ${story.author}`);
+  if ((q.includes('cast') || q.includes('actor') || q.includes('star')) && story.cast) parts.push(`Cast: ${Array.isArray(story.cast) ? story.cast.join(', ') : story.cast}`);
+  if ((q.includes('release') || q.includes('year') || q.includes('date')) && story.publishedAt) parts.push(`Published: ${story.publishedAt}`);
+  if ((q.includes('topic') || q.includes('theme') || q.includes('about')) && story.topics) parts.push(`Topics: ${(story.topics || []).join(', ')}`);
+  if ((q.includes('summary') || q.includes('about') || q.includes('plot') || q.includes('descr')) && story.summary) parts.push(`Summary: ${story.summary.slice(0, 200)}`);
+  if (q.includes('source') && story.source) parts.push(`Source: ${story.source}`);
+  if (parts.length > 0) return { answer: parts.join('. '), source: 'content:metadata' };
+  return null;
+}
+
+/**
+ * _webSearch — Perform a web search using Brave Search API (or skip gracefully).
+ */
+async function _webSearch(query) {
+  const apiKey = process.env.BRAVE_SEARCH_API_KEY;
+  if (!apiKey) return null;
+  try {
+    const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=3`;
+    const res = await fetch(url, {
+      headers: { 'Accept': 'application/json', 'X-Subscription-Token': apiKey },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const results = (data.web?.results || []).slice(0, 3);
+    if (results.length === 0) return null;
+    return results.map(r => `${r.title}: ${r.description || ''}`).join(' | ');
+  } catch {
+    return null;
+  }
+}
+
+// ─── RESOLVE PHASE ────────────────────────────────────────────────────────────
+
+/**
+ * resolveInvestigationQuestions — Resolve phase: answer each investigation question.
+ *
+ * For each question:
+ *   1. Check KG (user history, insights, interests, beliefs, hypotheses)
+ *   2. Check content metadata (genre, cast, director, topics, summary)
+ *   3. Web search ONLY if web gate LLM call says it gives user-specific signal
+ *
+ * @param {Array<{question: string, rationale: string, source_hint: string}>} questions
+ * @param {Object} story   - Candidate content
+ * @param {Object} kg      - KnowledgeGraph instance or user object
+ * @param {string} domain  - Content domain
+ * @param {Object} [llm]   - LLM client (optional)
+ * @returns {Promise<Array<{question: string, answer: string, source: string}>>}
+ */
+export async function resolveInvestigationQuestions(questions, story, kg, domain = 'content', llm = null) {
+  if (!questions || questions.length === 0) return [];
+
+  const resolved = await Promise.all(questions.map(async (q) => {
+    const question = q.question;
+
+    const kgAnswer = _resolveFromKG(question, kg);
+    if (kgAnswer) return { question, answer: kgAnswer.answer, source: kgAnswer.source };
+
+    const metaAnswer = _resolveFromMetadata(question, story);
+    if (metaAnswer) return { question, answer: metaAnswer.answer, source: metaAnswer.source };
+
+    let webAnswer = null;
+    try {
+      const shouldSearch = await _webGateJudge(question, domain, llm);
+      if (shouldSearch) {
+        const searchQuery = `${story.title || ''} ${question}`.slice(0, 150);
+        webAnswer = await _webSearch(searchQuery);
+      }
+    } catch {
+      // web gate failure is non-fatal
+    }
+
+    if (webAnswer) return { question, answer: webAnswer, source: 'web:brave' };
+    return { question, answer: null, source: 'unresolved' };
+  }));
+
+  return resolved;
+}
+
+// ─── OBSERVER / JUDGE ─────────────────────────────────────────────────────────
+
+/**
+ * evaluateConfidence — Observer/Judge: assess confidence in the resolved Q&A round.
+ *
+ * Computes confidence from resolved ratio, KG anchoring, and loop depth.
+ * Returns {confidence, missing, shouldLoop, reason}.
+ *
+ * Loop control:
+ *   - if shouldLoop && loopNum < 3: caller should generate targeted follow-up questions
+ *   - if loopNum >= 3 OR confidence >= 0.7: exit the investigate→resolve loop
+ *
+ * @param {Object} userProfile   - KG user object
+ * @param {Object} story         - Candidate content
+ * @param {Array}  qaRounds      - Accumulated [{question, answer, source}, ...] from all loops
+ * @param {number} loopNum       - Current loop iteration (0-indexed)
+ * @param {Object} [llm]         - Optional LLM client (reserved for future LLM-based judge)
+ * @returns {Promise<{confidence: number, missing: string[], shouldLoop: boolean, reason: string}>}
+ */
+export async function evaluateConfidence(userProfile, story, qaRounds, loopNum, llm = null) {
+  if (!qaRounds || qaRounds.length === 0) {
+    return { confidence: 0.3, missing: [], shouldLoop: false, reason: 'no qa rounds available' };
+  }
+
+  const resolved = qaRounds.filter(q => q.answer && q.source !== 'unresolved');
+  const unresolved = qaRounds.filter(q => !q.answer || q.source === 'unresolved');
+  const resolvedRatio = resolved.length / qaRounds.length;
+
+  // Base confidence: 0.2 at 0% resolved → 0.70 at 100% resolved
+  let confidence = 0.2 + resolvedRatio * 0.5;
+
+  // Boost for KG-anchored answers
+  const kgAnswers = resolved.filter(q => q.source?.startsWith('kg:'));
+  confidence += Math.min(kgAnswers.length * 0.05, 0.15);
+
+  // Boost for web-resolved answers
+  const webAnswers = resolved.filter(q => q.source?.startsWith('web:'));
+  confidence += Math.min(webAnswers.length * 0.03, 0.09);
+
+  // Penalize very thin story content
+  if (!story?.summary && !(story?.topics?.length)) confidence -= 0.1;
+
+  // Diminishing returns on repeated loops
+  confidence -= loopNum * 0.05;
+
+  confidence = Math.max(0.1, Math.min(0.95, confidence));
+  confidence = Math.round(confidence * 1000) / 1000;
+
+  const missing = unresolved.map(q => q.question);
+  const shouldLoop = confidence < 0.7 && loopNum < 3 && missing.length > 0;
+
+  return {
+    confidence,
+    missing,
+    shouldLoop,
+    reason: `${resolved.length}/${qaRounds.length} resolved, ${kgAnswers.length} KG-anchored (loop ${loopNum})`,
+  };
+}
+
+/**
+ * _resolvedContextAdjustment — Score delta from resolved Q&A context.
+ *
+ * +0.05 per confirmed match between resolved answer and user KG interests/beliefs/preferences.
+ * -0.05 per surface mismatch (resolved answer contains explicit negation of user preference).
+ * Capped at ±0.15 total.
+ */
+function _resolvedContextAdjustment(resolvedContext, story, kg) {
+  if (!resolvedContext || resolvedContext.length === 0) return 0;
+
+  const user = kg?.user || kg || {};
+  const interests = (user.interests || []).map(i =>
+    typeof i === 'string' ? i.toLowerCase() : (i.topic || '').toLowerCase()
+  ).filter(s => s.length > 2);
+  const beliefs = (user.beliefs || []).map(b =>
+    typeof b === 'string' ? b.toLowerCase() : (b.claim || b.text || '').toLowerCase()
+  ).filter(s => s.length > 2);
+  const preferences = (user.preferences || []).map(p =>
+    typeof p === 'string' ? p.toLowerCase() : (p.description || '').toLowerCase()
+  ).filter(s => s.length > 2);
+
+  const allUserSignals = [...interests, ...beliefs, ...preferences];
+
+  let delta = 0;
+  for (const qa of resolvedContext) {
+    if (!qa.answer || qa.source === 'unresolved') continue;
+    const answerLower = qa.answer.toLowerCase();
+
+    const hasMatch = allUserSignals.some(signal => answerLower.includes(signal));
+    if (hasMatch) delta += 0.05;
+
+    if (
+      answerLower.includes('does not match') ||
+      answerLower.includes('not interested') ||
+      answerLower.includes('dislikes') ||
+      answerLower.includes('avoids')
+    ) {
+      delta -= 0.05;
+    }
+  }
+
+  return Math.max(-0.15, Math.min(0.15, Math.round(delta * 1000) / 1000));
+}
+
+// ─── DEEP PIPELINE WITH RESOLVE ──────────────────────────────────────────────
+
+/**
+ * swarmScoreDeepWithResolve — Investigate → Resolve → Judge → Score pipeline.
+ *
+ * Runs the full deep pipeline with 3-loop control:
+ *   - Loop: generate questions → resolve → judge confidence
+ *   - Exit if confidence >= 0.7 or loopNum >= 3
+ *   - Re-score with accumulated resolvedContext injected as scoring signal
+ *
+ * @param {Object} story   - Candidate content
+ * @param {Object} kg      - Knowledge graph
+ * @param {Object} [opts]  - Options {llm, userId, date, mode, kgSummary, domain, fleet, ...}
+ *   opts.mode must be 'deep' to enable investigation+resolve+judge loop
+ * @returns {Promise<Object>} swarmScore result + investigationQuestions + resolvedContext + loopNum
+ */
+export async function swarmScoreDeepWithResolve(story, kg, opts = {}) {
+  const baseResult = swarmScore(story, kg, opts);
+
+  if (opts.mode !== 'deep') {
+    return baseResult;
+  }
+
+  const domain = opts.domain || 'content';
+  const kgSummary = opts.kgSummary || _buildKgSummary(kg);
+  const userProfile = kg?.user || kg || {};
+
+  let investigationQuestions = [];
+  let allResolvedContext = [];
+  let loopNum = 0;
+  const MAX_LOOPS = 3;
+
+  try {
+    investigationQuestions = await generateInvestigationQuestions(story, kgSummary, domain, opts.llm);
+  } catch {
+    investigationQuestions = [];
+  }
+
+  // Investigate → Resolve → Judge loop (max 3 iterations)
+  while (investigationQuestions.length > 0 && loopNum < MAX_LOOPS) {
+    let roundResolved = [];
+    try {
+      roundResolved = await resolveInvestigationQuestions(investigationQuestions, story, kg, domain, opts.llm);
+    } catch {
+      roundResolved = [];
+    }
+    allResolvedContext.push(...roundResolved);
+
+    const judgment = await evaluateConfidence(userProfile, story, allResolvedContext, loopNum, opts.llm);
+
+    if (!judgment.shouldLoop) break;
+
+    loopNum++;
+    if (loopNum >= MAX_LOOPS) break;
+
+    try {
+      const missingSummary = judgment.missing.slice(0, 5).join('; ');
+      const targetedKgSummary = kgSummary + (missingSummary ? `\nStill unresolved: ${missingSummary}` : '');
+      const nextQuestions = await generateInvestigationQuestions(story, targetedKgSummary, domain, opts.llm);
+      const answeredSet = new Set(
+        allResolvedContext.filter(q => q.answer).map(q => q.question.toLowerCase().slice(0, 60))
+      );
+      investigationQuestions = nextQuestions.filter(
+        q => !answeredSet.has(q.question.toLowerCase().slice(0, 60))
+      );
+    } catch {
+      break;
+    }
+  }
+
+  // Re-score with accumulated resolved context injected as scoring signal
+  const finalResult = swarmScore(story, kg, { ...opts, resolvedContext: allResolvedContext });
+
+  return {
+    ...finalResult,
+    investigationQuestions,
+    resolvedContext: allResolvedContext,
+    loopNum,
+    mode: 'deep',
+  };
 }
