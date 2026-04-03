@@ -873,6 +873,60 @@ export class Scorer {
   }
 
   /**
+   * Build structured KG summary with typed nodes for swarm agents.
+   * Includes beliefs, preferences, identities sorted by strength,
+   * with graceful degradation when typed nodes are empty.
+   */
+  #buildKgSummaryForSwarm() {
+    const kgUser = this.kg?.user || {};
+    const now = Date.now();
+    const isActive = node => {
+      const from = node.valid_from ? new Date(node.valid_from).getTime() : 0;
+      const to = node.valid_to ? new Date(node.valid_to).getTime() : Infinity;
+      return from <= now && now < to;
+    };
+
+    const beliefs = (kgUser.beliefs || [])
+      .filter(isActive)
+      .sort((a, b) => (b.strength || 0) - (a.strength || 0))
+      .slice(0, 10)
+      .map(b => ({ topic: b.topic, claim: b.claim, confidence: b.strength }));
+
+    const preferences = (kgUser.preferences || [])
+      .filter(isActive)
+      .sort((a, b) => Math.abs(b.strength || 0) - Math.abs(a.strength || 0))
+      .slice(0, 15)
+      .map(p => ({ type: p.type, description: p.description, strength: p.strength }));
+
+    const identities = (kgUser.identities || [])
+      .filter(isActive)
+      .sort((a, b) => (b.salience || 0) - (a.salience || 0))
+      .slice(0, 5)
+      .map(id => ({ role: id.role, context: id.context, salience: id.salience }));
+
+    const history = (kgUser.history || []).slice(-10).map(h => ({
+      title: h.story_id || h.title || h.topic || '',
+      reaction: h.reaction || '',
+      topics: h.topics || [],
+    }));
+
+    const role = identities[0]?.role || kgUser.role || '';
+
+    return {
+      role,
+      interests: (kgUser.interests || []).slice(0, 15).map(i =>
+        typeof i === 'string' ? { topic: i } : i
+      ),
+      beliefs,
+      preferences,
+      identities,
+      history,
+      recentEngagement: history,
+      avoidPatterns: kgUser.avoid_patterns || kgUser.avoidPatterns || [],
+    };
+  }
+
+  /**
    * Freshness decay — older stories get penalized
    */
   #freshnessDecay(story) {
@@ -1030,15 +1084,10 @@ export class Scorer {
       const sample = stories[0];
       const contentSample = `${sample?.title || ''} ${sample?.summary || ''}`.trim();
       const domain = sample?.domain || 'unknown';
-      const kgUser = this.kg?.user || {};
-      const kgSummary = {
-        interests: kgUser.interests || [],
-        history: (kgUser.history || []).slice(-20),
-        avoidPatterns: kgUser.avoid_patterns || kgUser.avoidPatterns || [],
-      };
+      const kgSummary = this.#buildKgSummaryForSwarm();
       const activeClones = typeof this.kg?.getActiveClones === 'function'
         ? this.kg.getActiveClones()
-        : (kgUser.clones || []).filter(c => c.status === 'active');
+        : (this.kg?.user?.clones || []).filter(c => c.status === 'active');
       fleet = await generateAgentFleet(domain, contentSample, kgSummary, null, activeClones.length ? activeClones : null);
     } catch (err) {
       console.warn('[Scorer] Fleet generation failed, falling back to static frames:', err.message);
