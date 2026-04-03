@@ -124,12 +124,8 @@ class LightweightMarbleScorer {
     if (this.options.enableEmbeddings) {
       const embeddings = await this.loadEmbeddings();
       if (embeddings) {
-        try {
-          const semanticScore = await this.computeSemanticScore(story, embeddings);
-          enhancedScore = this.blendScores(basicScore, semanticScore, 0.7);
-        } catch (error) {
-          console.warn('Semantic scoring failed, using basic score:', error.message);
-        }
+        const semanticScore = await this.computeSemanticScore(story, embeddings);
+        enhancedScore = this.blendScores(basicScore, semanticScore, 0.7);
       }
     }
 

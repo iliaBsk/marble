@@ -486,16 +486,7 @@ export class Scorer {
       return score;
 
     } catch (error) {
-      console.warn('Preference alignment semantic matching failed:', error.message);
-      // Basic topic matching fallback
-      let score = 0;
-      for (const topic of story.topics) {
-        const preference = userPreferences.find(p => p.topic === topic);
-        if (preference) {
-          score = Math.max(score, preference.strength);
-        }
-      }
-      return score;
+      throw new Error(`Preference alignment failed (no keyword fallback): ${error.message}`);
     }
   }
 
