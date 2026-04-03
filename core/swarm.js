@@ -772,17 +772,37 @@ function _buildSpecScorer(spec) {
 async function _generateFleetFromLLM(domain, contentSample, kgSummary, llm) {
   const client = llm || createLLMClient();
 
-  // Compact KG representation: pull what matters for motivation inference
+  // Compact KG representation: pull typed nodes + legacy fields
   const kg = kgSummary || {};
   const interests = (kg.interests || []).slice(0, 15).map(i =>
     typeof i === 'string' ? i : `${i.topic || i.name}${i.trend ? ` (${i.trend})` : ''}`
   );
   const avoidPatterns = (kg.avoidPatterns || kg.avoid_patterns || []).slice(0, 8);
   const role = kg.role || kg.identity?.role || '';
-  const recentEngagement = (kg.recentEngagement || kg.recent_engagement || []).slice(0, 8);
-  const history = (kg.history || []).slice(-10).map(h => h.title || h.topic || h);
 
-  const kgStr = JSON.stringify({ role, interests, avoidPatterns, recentEngagement, history }, null, 0).slice(0, 900);
+  // Typed nodes — structured data from KG Layer 1
+  const beliefs = (kg.beliefs || []).slice(0, 10);
+  const preferences = (kg.preferences || []).slice(0, 15);
+  const identities = (kg.identities || []).slice(0, 5);
+  const recentSignals = (kg.history || kg.recentEngagement || []).slice(-10);
+
+  // Build structured profile string
+  const profileParts = [];
+  if (role) profileParts.push(`Role: ${role}`);
+  if (identities.length) profileParts.push(`Identity: ${identities.map(id => `${id.role}${id.context ? ` (${id.context})` : ''}`).join(', ')}`);
+  if (beliefs.length) profileParts.push(`Beliefs: ${JSON.stringify(beliefs)}`);
+  if (preferences.length) {
+    const strong = preferences.map(p => `${p.description || p.type} (${p.strength > 0 ? '+' : ''}${p.strength})`);
+    profileParts.push(`Strong preferences: ${strong.join(', ')}`);
+  }
+  if (interests.length) profileParts.push(`Interests: ${interests.join(', ')}`);
+  if (recentSignals.length) {
+    const recent = recentSignals.map(h => `${h.title || h.story_id || '?'}: ${h.reaction || '?'}`);
+    profileParts.push(`Recent: ${recent.join(', ')}`);
+  }
+  if (avoidPatterns.length) profileParts.push(`Avoids: ${avoidPatterns.join(', ')}`);
+
+  const kgStr = profileParts.join('\n').slice(0, 1200);
 
   const prompt = `You are designing a personalized scoring agent fleet for Marble.
 
@@ -1017,14 +1037,18 @@ export async function explodeAgentQuestions(agent, contentSample, kgSummary, llm
   const exclusiveDimension = agentSpec.exclusive_dimension || '';
   const siblingQuestions = (opts.siblingQuestions || []).slice(0, 12).join('\n  - ');
 
-  // Compact user profile for question generation
+  // Compact user profile for question generation — uses typed nodes when available
   const kg = kgSummary || {};
   const topInterests = (kg.interests || []).slice(0, 10).map(i =>
     typeof i === 'string' ? i : `${i.topic || i.name}${i.trend ? ` (${i.trend})` : ''}`
   ).join(', ');
   const avoidPatterns = (kg.avoidPatterns || kg.avoid_patterns || []).slice(0, 6).join(', ');
-  const likedHistory = (kg.history || []).filter(h => h.reaction === 'liked' || h.score > 0.7).slice(-5).map(h => h.title || h.topic || h).join(', ');
-  const dislikedHistory = (kg.history || []).filter(h => h.reaction === 'disliked' || h.score < 0.3).slice(-5).map(h => h.title || h.topic || h).join(', ');
+  const likedHistory = (kg.history || []).filter(h => h.reaction === 'up' || h.reaction === 'liked' || h.score > 0.7).slice(-5).map(h => h.title || h.story_id || h.topic || h).join(', ');
+  const dislikedHistory = (kg.history || []).filter(h => h.reaction === 'down' || h.reaction === 'disliked' || h.score < 0.3).slice(-5).map(h => h.title || h.story_id || h.topic || h).join(', ');
+  // Typed KG nodes
+  const userBeliefs = (kg.beliefs || []).slice(0, 5).map(b => `${b.topic}: ${b.claim} (${b.confidence})`).join(', ');
+  const userPreferences = (kg.preferences || []).slice(0, 8).map(p => `${p.description || p.type} (${p.strength > 0 ? '+' : ''}${p.strength})`).join(', ');
+  const userIdentity = (kg.identities || []).slice(0, 3).map(id => id.role).join(', ');
 
   const prompt = `You are the "${agentName}" evaluation agent in Marble, a personalized content ranking system.
 
@@ -1035,7 +1059,10 @@ ${inferredMotivation ? `Why this user consumes this content type: ${inferredMoti
 ${siblingQuestions ? `FORBIDDEN — these questions are already covered by sibling agents (do NOT ask anything semantically similar):\n  - ${siblingQuestions}` : ''}
 
 This user's taste profile:
-${topInterests ? `- Strong interests: ${topInterests}` : ''}
+${userIdentity ? `- Identity: ${userIdentity}` : ''}
+${userBeliefs ? `- Beliefs: ${userBeliefs}` : ''}
+${userPreferences ? `- Strong preferences: ${userPreferences}` : ''}
+${topInterests ? `- Interests: ${topInterests}` : ''}
 ${interestAnchors ? `- Topics most relevant to your lens: ${interestAnchors}` : ''}
 ${likedHistory ? `- Examples of content they've enjoyed: ${likedHistory}` : ''}
 ${dislikedHistory ? `- Examples of content they've disliked: ${dislikedHistory}` : ''}
@@ -1626,17 +1653,70 @@ export async function swarmScoreDeep(story, kg, opts = {}) {
   };
 }
 
-/** Build a compact KG summary string for LLM context. */
+/**
+ * Build a structured KG summary object for LLM context.
+ * Includes typed memory nodes (beliefs, preferences, identities) when available,
+ * falling back to flat summary fields for KGs without typed nodes.
+ */
 function _buildKgSummary(kg) {
   const user = kg?.user || {};
-  const insights = (user.insights || []).slice(0, 5).map(i => i.text || i).join('; ');
-  const interests = (user.interests || []).slice(0, 8).join(', ');
-  const hypotheses = (user.hypotheses || []).slice(0, 3).map(h => h.text || h).join('; ');
-  return [
-    insights && `Insights: ${insights}`,
-    interests && `Interests: ${interests}`,
-    hypotheses && `Hypotheses: ${hypotheses}`,
-  ].filter(Boolean).join('\n');
+
+  // Legacy flat fields
+  const insights = (user.insights || []).slice(0, 5).map(i => i.text || i);
+  const interests = (user.interests || []).slice(0, 15).map(i =>
+    typeof i === 'string' ? { topic: i } : i
+  );
+  const hypotheses = (user.hypotheses || []).slice(0, 3).map(h => h.text || h);
+
+  // Typed memory nodes — active only, sorted by strength/confidence
+  const now = Date.now();
+  const isActive = node => {
+    const from = node.valid_from ? new Date(node.valid_from).getTime() : 0;
+    const to = node.valid_to ? new Date(node.valid_to).getTime() : Infinity;
+    return from <= now && now < to;
+  };
+
+  const beliefs = (user.beliefs || [])
+    .filter(isActive)
+    .sort((a, b) => (b.strength || 0) - (a.strength || 0))
+    .slice(0, 10)
+    .map(b => ({ topic: b.topic, claim: b.claim, confidence: b.strength }));
+
+  const preferences = (user.preferences || [])
+    .filter(isActive)
+    .sort((a, b) => Math.abs(b.strength || 0) - Math.abs(a.strength || 0))
+    .slice(0, 15)
+    .map(p => ({ type: p.type, description: p.description, strength: p.strength }));
+
+  const identities = (user.identities || [])
+    .filter(isActive)
+    .sort((a, b) => (b.salience || 0) - (a.salience || 0))
+    .slice(0, 5)
+    .map(id => ({ role: id.role, context: id.context, salience: id.salience }));
+
+  // Recent signals from history
+  const history = (user.history || []).slice(-10).map(h => ({
+    title: h.story_id || h.title || h.topic || '',
+    reaction: h.reaction || '',
+    topics: h.topics || [],
+  }));
+
+  // Primary role from identities or legacy field
+  const role = identities[0]?.role || user.role || '';
+
+  return {
+    role,
+    interests,
+    beliefs,
+    preferences,
+    identities,
+    history,
+    recentEngagement: history,
+    // Legacy fields for backward compat with _sparseContentScore etc.
+    insights,
+    hypotheses,
+    avoidPatterns: (user.avoidPatterns || user.avoid_patterns || []),
+  };
 }
 
 // ─── RESOLVE PHASE HELPERS ───────────────────────────────────────────────────
@@ -1965,7 +2045,8 @@ export async function swarmScoreDeepWithResolve(story, kg, opts = {}) {
 
     try {
       const missingSummary = judgment.missing.slice(0, 5).join('; ');
-      const targetedKgSummary = kgSummary + (missingSummary ? `\nStill unresolved: ${missingSummary}` : '');
+      const kgBase = typeof kgSummary === 'string' ? kgSummary : JSON.stringify(kgSummary);
+      const targetedKgSummary = kgBase + (missingSummary ? `\nStill unresolved: ${missingSummary}` : '');
       const nextQuestions = await generateInvestigationQuestions(story, targetedKgSummary, domain, opts.llm);
       const answeredSet = new Set(
         allResolvedContext.filter(q => q.answer).map(q => q.question.toLowerCase().slice(0, 60))
