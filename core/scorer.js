@@ -516,7 +516,14 @@ export class Scorer {
       return score;
 
     } catch (error) {
-      throw new Error(`Preference alignment failed (no keyword fallback): ${error.message}`);
+      // Embeddings unavailable — fall back to topic-based preference matching
+      console.warn(`[scorer] preference alignment embedding failed (${error.message}), using topic fallback`);
+      let score = 0;
+      for (const topic of story.topics) {
+        const preference = userPreferences.find(p => p.topic === topic);
+        if (preference) score = Math.max(score, preference.strength);
+      }
+      return score;
     }
   }
 
@@ -737,7 +744,11 @@ export class Scorer {
       return max * 0.8; // Slightly lower for non-semantic matches
 
     } catch (error) {
-      throw new Error(`Semantic matching failed (no keyword fallback): ${error.message}`);
+      // Embeddings unavailable — fall back to topic-based interest matching
+      console.warn(`[scorer] interest match embedding failed (${error.message}), using topic fallback`);
+      const weights = story.topics.map(t => this.kg?.getInterestWeight?.(t) || 0);
+      if (weights.every(w => w === 0)) return 0.1;
+      return Math.max(...weights) * 0.8;
     }
   }
 

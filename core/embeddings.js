@@ -5,7 +5,9 @@
  * Supported providers: openai (default), deepseek
  *
  * Requires OPENAI_API_KEY (or DEEPSEEK_API_KEY for deepseek provider).
- * No local/ONNX fallback — if API call fails, it throws.
+ * If the provider cannot be initialised (missing key) or an API call fails at
+ * runtime, a NullEmbeddings fallback is used — findMostSimilar() returns no
+ * match so callers fall through to their keyword/topic-based fallback paths.
  */
 
 /**
@@ -122,6 +124,20 @@ class DeepSeekEmbeddings extends OpenAIEmbeddings {
 }
 
 /**
+ * NullEmbeddings — zero-capability fallback used when no API key is available
+ * or when the real provider fails.  All methods return "no match" so callers
+ * fall through to their topic/keyword-based fallback paths automatically.
+ */
+class NullEmbeddings {
+  async embed(_text) { return new Float32Array(0); }
+  async embedBatch(texts) { return texts.map(() => new Float32Array(0)); }
+  cosineSimilarity(_a, _b) { return 0; }
+  async findMostSimilar(_query, _candidates, _threshold) {
+    return { text: null, similarity: -1, index: -1 };
+  }
+}
+
+/**
  * Factory: create an embeddings provider based on EMBEDDINGS_PROVIDER env var
  * or the provider option.
  *
@@ -129,11 +145,11 @@ class DeepSeekEmbeddings extends OpenAIEmbeddings {
  *   openai    — (default) OpenAI text-embedding-3-small, requires OPENAI_API_KEY, 1536 dimensions
  *   deepseek  — DeepSeek embeddings API, requires DEEPSEEK_API_KEY, 1536 dimensions
  *
- * If no OPENAI_API_KEY is set and provider is openai (default), throws a clear error.
- * There is no local/ONNX fallback.
+ * If the provider cannot be initialised (e.g. missing API key) a NullEmbeddings
+ * instance is returned so the rest of the system degrades gracefully.
  *
  * @param {Object} options - Options passed to the provider constructor
- * @returns {OpenAIEmbeddings|DeepSeekEmbeddings}
+ * @returns {OpenAIEmbeddings|DeepSeekEmbeddings|NullEmbeddings}
  */
 function createEmbeddingsProvider(options = {}) {
   const provider = (options.provider || process.env.EMBEDDINGS_PROVIDER || 'openai').toLowerCase();
@@ -164,7 +180,16 @@ function createEmbeddingsProvider(options = {}) {
   }
 }
 
-// Export singleton instance (respects EMBEDDINGS_PROVIDER env var)
-export const embeddings = createEmbeddingsProvider();
+// Export singleton instance (respects EMBEDDINGS_PROVIDER env var).
+// If the provider cannot be initialised (e.g. missing API key) we fall back to
+// NullEmbeddings so the module loads cleanly and callers degrade gracefully.
+export const embeddings = (() => {
+  try {
+    return createEmbeddingsProvider();
+  } catch (err) {
+    console.warn(`[embeddings] Provider init failed (${err.message}) — using NullEmbeddings. Embedding-based scoring will be skipped.`);
+    return new NullEmbeddings();
+  }
+})();
 
-export { OpenAIEmbeddings, DeepSeekEmbeddings, createEmbeddingsProvider };
+export { OpenAIEmbeddings, DeepSeekEmbeddings, NullEmbeddings, createEmbeddingsProvider };
