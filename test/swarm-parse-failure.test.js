@@ -156,4 +156,35 @@ describe('swarm parse-failure: cascading extraction (Fix 4)', () => {
     assert.ok(fencedWarn, `Expected a console.warn about fenced extraction. Got: ${JSON.stringify(warnMessages)}`);
   });
 
+  it('Swarm#curate: truncated JSON (token-limit cut-off) → partial recovery returns >=1 pick', async () => {
+    clearWarnings();
+    // Simulates a Contrarian Agent response cut off mid-string by token limit
+    const truncatedResponse = '{ "picks": [{ "index": 1, "score": 0.9, "reason": "Combining comedy with drama, \'Cool Hand Luke\'...';
+
+    const mockKg = { interests: {}, history: [], context: {}, patterns: {}, source_trust: {} };
+    const swarm = new Swarm(mockKg, {
+      mode: 'deep',
+      llm: async () => truncatedResponse,
+      topN: 10,
+    });
+    swarm.clone.takeSnapshot = () => {};
+    swarm.clone._snapshot = {
+      interests: {},
+      context: { projects: [], calendar: [], conversations: [] },
+      patterns: { loves: [], avoids: [] },
+      source_trust: {},
+    };
+    swarm.clone.wouldEngage = () => 0.5;
+
+    const stories = [
+      { id: 's1', title: 'Cool Hand Luke', summary: 'Classic drama-comedy film.', source: 'test', topics: ['film'] }
+    ];
+
+    const result = await swarm.curate(stories);
+
+    assert.ok(result.length > 0, `partial recovery should yield >=1 result (got ${result.length})`);
+    const recoveryWarn = warnMessages.find(m => m.includes('partial recovery'));
+    assert.ok(recoveryWarn, `Expected a console.warn about partial recovery. Got: ${JSON.stringify(warnMessages)}`);
+  });
+
 });

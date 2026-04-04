@@ -64,6 +64,38 @@ function _extractJSON(response, agentName = 'unknown') {
       return r;
     } catch {}
   }
+  // 5. Partial recovery — truncated JSON (e.g. token-limit cut-off mid-string)
+  // Strategy A: find last complete pick object (has a closing '}') and close array+outer.
+  const picksKeyIdx = s.indexOf('"picks"');
+  if (picksKeyIdx !== -1) {
+    const arrOpenIdx = s.indexOf('[', picksKeyIdx);
+    if (arrOpenIdx !== -1) {
+      const lastBrace = s.lastIndexOf('}');
+      if (lastBrace > arrOpenIdx) {
+        const candidate = s.slice(s.indexOf('{'), lastBrace + 1) + ']}';
+        try {
+          const r = JSON.parse(candidate);
+          if (r && Array.isArray(r.picks) && r.picks.length > 0) {
+            parseFailureCounter.increment(agentName);
+            console.warn(`[Swarm] _extractJSON — ${agentName}: partial recovery recovered ${r.picks.length} pick(s) from truncated JSON`);
+            return r;
+          }
+        } catch {}
+      }
+      // Strategy B: no complete pick objects — extract index+score pairs via regex
+      const pickPattern = /"index"\s*:\s*(\d+)[^}]*?"score"\s*:\s*([\d.]+)/g;
+      const picks = [];
+      let m;
+      while ((m = pickPattern.exec(s)) !== null) {
+        picks.push({ index: parseInt(m[1], 10), score: parseFloat(m[2]), reason: '' });
+      }
+      if (picks.length > 0) {
+        parseFailureCounter.increment(agentName);
+        console.warn(`[Swarm] _extractJSON — ${agentName}: partial recovery recovered ${picks.length} pick(s) from truncated JSON (regex fallback)`);
+        return { picks };
+      }
+    }
+  }
   // All strategies failed
   parseFailureCounter.increment(agentName);
   return null;
