@@ -27,14 +27,18 @@ class CloneVariant extends Clone {
    * @param {number} mutationRate - How much to mutate (0-1)
    * @returns {CloneVariant} New mutated variant
    */
-  mutate(mutationRate = 0.1) {
+  mutate(mutationRate = 0.1, sampleCount = 50) {
     const newWeights = {};
     let totalWeight = 0;
+    const initialWeights = SCORE_WEIGHTS;
 
-    // Mutate each weight
+    // Mutate each weight with regularization toward prior
     for (const [key, value] of Object.entries(this.weights)) {
       const mutation = (Math.random() - 0.5) * 2 * mutationRate;
-      newWeights[key] = Math.max(0, Math.min(1, value + mutation));
+      // Pull weight back toward initial value — strength inversely proportional to evidence
+      const regularization = (initialWeights[key] || value) * (1 / Math.sqrt(Math.max(1, sampleCount)));
+      const regularizedValue = value + mutation + ((initialWeights[key] || value) - value) * regularization;
+      newWeights[key] = Math.max(0.01, Math.min(1, regularizedValue)); // min 0.01 to prevent zero weights
       totalWeight += newWeights[key];
     }
 
@@ -173,6 +177,12 @@ export class ClonePopulation {
    * @param {Array} reactionData - Recent user reactions for fitness evaluation
    */
   evolve(reactionData = []) {
+    // Fix 5: minimum sample gate — skip evolution with insufficient data to prevent overfitting
+    if (reactionData.length < 15) {
+      console.log(`[Evolution] Skipping evolve — only ${reactionData.length} reactions (min 15 required)`);
+      return;
+    }
+
     // Evaluate fitness for all variants
     for (const variant of this.variants) {
       variant.fitness = this.evaluateFitness(variant, reactionData);
@@ -196,9 +206,10 @@ export class ClonePopulation {
       // Select parent based on fitness-weighted selection
       const parent = this._selectParent(survivors);
 
-      // Create mutated offspring
-      const mutationRate = 0.1 + (0.1 * Math.random()); // 10-20% mutation
-      const offspring = parent.mutate(mutationRate);
+      // Create mutated offspring — scale mutation rate down with sample size to reduce drift
+      const baseMutation = Math.max(0.02, 0.15 - (reactionData.length / 1000));
+      const mutationRate = baseMutation + (baseMutation * 0.5 * Math.random());
+      const offspring = parent.mutate(mutationRate, reactionData.length);
       this.variants.push(offspring);
     }
 

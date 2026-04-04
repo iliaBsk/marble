@@ -53,8 +53,20 @@ export class Scorer {
    * improved opinion/preference prediction over the legacy interest_match bucket.
    */
   async score(stories) {
-    const scored = await Promise.all(stories.map(story => this.#scoreOne(story)));
-    return scored.sort((a, b) => b.relevance_score - a.relevance_score);
+    // Fix 1: compute slate-level max rating count for normalized popularity_score
+    const maxRatingCount = Math.max(1, ...stories.map(s =>
+      s.rating_count || s.vote_count || s.num_ratings || s.ratings_count || 0
+    ));
+    const scored = await Promise.all(stories.map(story => this.#scoreOne(story, { maxRatingCount })));
+    // Fix 3: tie-breaking within epsilon — use popularity as secondary sort to reduce noise
+    const EPSILON = 0.01;
+    return scored.sort((a, b) => {
+      const diff = b.relevance_score - a.relevance_score;
+      if (Math.abs(diff) < EPSILON) {
+        return (b.popularity_score || 0) - (a.popularity_score || 0);
+      }
+      return diff;
+    });
   }
 
   /**
@@ -149,7 +161,7 @@ export class Scorer {
     };
   }
 
-  async #scoreOne(story) {
+  async #scoreOne(story, { maxRatingCount = 1 } = {}) {
     // If using metric-driven scoring, delegate to the engine
     if (!this.legacyMode && this.metricEngine) {
       const legacyScores = await this.#computeLegacyScores(story);
@@ -169,9 +181,17 @@ export class Scorer {
       const entityBoost = secondaryNodeCount >= 2 ? entityAffinity * 0.15 : entityAffinity * 0.05;
       const boostedScore = Math.max(0, Math.min(1, relevance_score + entityBoost));
 
+      // Fix 1: Bayesian popularity blend — sparse profiles lean on popularity, rich profiles lean on Marble
+      const rawPopCount = story.rating_count || story.vote_count || story.num_ratings || story.ratings_count || 0;
+      const popularity_score = rawPopCount > 0 ? rawPopCount / maxRatingCount : (story.avg_rating ? story.avg_rating / 5.0 : 0);
+      const userSignalCount = (this.kg?.user?.history || this.kg?.history || []).length;
+      const personalization_confidence = Math.min(1.0, userSignalCount / 50);
+      const final_score = popularity_score * (1 - personalization_confidence) + boostedScore * personalization_confidence;
+
       return {
         story,
-        relevance_score: boostedScore,
+        relevance_score: Math.max(0, Math.min(1, final_score)),
+        popularity_score,
         magic_score: result.magic_score,
         interest_match: legacyScores.interest_match,
         belief_alignment: legacyScores.belief_alignment,
@@ -291,11 +311,21 @@ export class Scorer {
     // Apply session-scoped adjustments
     const sessionBoost = this.#calculateSessionBoost(story);
     const baseScore = raw * freshness;
-    const relevance_score = Math.max(0, Math.min(1, baseScore + sessionBoost));
+    const marbleScore = Math.max(0, Math.min(1, baseScore + sessionBoost));
+
+    // Fix 1: Bayesian popularity blend — sparse profiles lean on popularity, rich profiles lean on Marble
+    const rawPopCount = story.rating_count || story.vote_count || story.num_ratings || story.ratings_count || 0;
+    const popularity_score = rawPopCount > 0 ? rawPopCount / maxRatingCount : (story.avg_rating ? story.avg_rating / 5.0 : 0);
+    const userSignalCount = (this.kg?.user?.history || this.kg?.history || []).length;
+    const personalization_confidence = Math.min(1.0, userSignalCount / 50);
+    const relevance_score = popularity_score > 0
+      ? Math.max(0, Math.min(1, popularity_score * (1 - personalization_confidence) + marbleScore * personalization_confidence))
+      : marbleScore;
 
     return {
       story,
       relevance_score,
+      popularity_score,
       interest_match: legacyScores.interest_match,
       belief_alignment: legacyScores.belief_alignment,
       preference_alignment: legacyScores.preference_alignment,

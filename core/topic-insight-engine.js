@@ -121,8 +121,11 @@ Return ONLY a JSON array, no markdown, no explanation.`;
 
     try {
       const response = await this.llmCall(prompt);
-      const cleaned = response.replace(/```json?\n?/g, '').replace(/```/g, '').trim();
-      const parsed = JSON.parse(cleaned);
+      const _s = String(response).trim();
+      let parsed = null;
+      try { parsed = JSON.parse(_s); } catch {}
+      if (parsed === null) { const _fm = _s.match(/```json?\s*\n?([\s\S]*?)\n?\s*```/); if (_fm) { try { parsed = JSON.parse(_fm[1].trim()); } catch {} } }
+      if (parsed === null) { const _as = _s.indexOf('['), _ae = _s.lastIndexOf(']'); if (_as !== -1 && _ae > _as) { try { parsed = JSON.parse(_s.slice(_as, _ae + 1)); } catch {} } }
       if (Array.isArray(parsed)) {
         return parsed.slice(0, this.maxDimensions).map(d => ({
           id: String(d.id || '').replace(/\s+/g, '_').toLowerCase(),
@@ -349,8 +352,11 @@ Rules:
 
     try {
       const response = await this.llmCall(prompt);
-      const cleaned = response.replace(/```json?\n?/g, '').replace(/```/g, '').trim();
-      const parsed = JSON.parse(cleaned);
+      const _s = String(response).trim();
+      let parsed = null;
+      try { parsed = JSON.parse(_s); } catch {}
+      if (parsed === null) { const _fm = _s.match(/```json?\s*\n?([\s\S]*?)\n?\s*```/); if (_fm) { try { parsed = JSON.parse(_fm[1].trim()); } catch {} } }
+      if (parsed === null) { const _as = _s.indexOf('['), _ae = _s.lastIndexOf(']'); if (_as !== -1 && _ae > _as) { try { parsed = JSON.parse(_s.slice(_as, _ae + 1)); } catch {} } }
       if (Array.isArray(parsed)) {
         return parsed.map(h => ({
           dimensionId: String(h.dimensionId || ''),

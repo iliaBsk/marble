@@ -29,6 +29,46 @@ export const parseFailureCounter = {
   report() { return { total: this.total(), byAgent: { ...this.counts } }; }
 };
 
+// ── JSON Extractor ─────────────────────────────────────────────
+// Cascading extraction: handles raw JSON, fenced JSON, and partial responses.
+// Counts parse failures so benchmarks can emit them as first-class metrics.
+function _extractJSON(response, agentName = 'unknown') {
+  const s = String(response).trim();
+  // 1. Raw parse
+  try { return JSON.parse(s); } catch {}
+  // 2. Fence extraction
+  const fenceMatch = s.match(/```json?\s*\n?([\s\S]*?)\n?\s*```/);
+  if (fenceMatch) {
+    try {
+      const r = JSON.parse(fenceMatch[1].trim());
+      parseFailureCounter.increment(agentName);
+      console.warn(`[Swarm] _extractJSON — ${agentName}: extracted JSON from fences (prompt misbehaving, counted as failure)`);
+      return r;
+    } catch {}
+  }
+  // 3. First { to last }
+  const objStart = s.indexOf('{'), objEnd = s.lastIndexOf('}');
+  if (objStart !== -1 && objEnd > objStart) {
+    try {
+      const r = JSON.parse(s.slice(objStart, objEnd + 1));
+      parseFailureCounter.increment(agentName);
+      return r;
+    } catch {}
+  }
+  // 4. First [ to last ]
+  const arrStart = s.indexOf('['), arrEnd = s.lastIndexOf(']');
+  if (arrStart !== -1 && arrEnd > arrStart) {
+    try {
+      const r = JSON.parse(s.slice(arrStart, arrEnd + 1));
+      parseFailureCounter.increment(agentName);
+      return r;
+    } catch {}
+  }
+  // All strategies failed
+  parseFailureCounter.increment(agentName);
+  return null;
+}
+
 // ── Agent Definitions ──────────────────────────────────────────
 
 const AGENT_LENSES = {
@@ -56,6 +96,12 @@ const AGENT_LENSES = {
     name: 'Serendipity Agent',
     mandate: 'Find stories that would genuinely delight, surprise, or inspire the user. Not clickbait — real moments of "I didn\'t know I needed to hear this today." Human stories, unexpected connections, the kind of thing you\'d screenshot and send to a friend.',
     weight: 0.20
+  },
+  // Fix 1: Social Proof Agent — injects popularity signal through the swarm reasoning layer
+  social_proof: {
+    name: 'Social Proof Agent',
+    mandate: 'Rank candidates by how well-received they are among the broader population and similar users. Prioritize content with strong community validation — high ratings, wide engagement, cultural relevance. This signal is most valuable when the user profile is sparse; weight it less when strong personalization data exists.',
+    weight: 0.10
   }
 };
 
@@ -310,13 +356,8 @@ export class Swarm {
       const response = await this.options.llm(prompt);
 
       try {
-        // Warn + skip: if LLM returns fenced JSON, the prompt is misbehaving — skip this agent
-        if (String(response).includes('```')) {
-          console.warn(`[Swarm] PARSE SKIP — ${agent.lens.name}: LLM returned fenced JSON (prompt misbehaving). Agent contributes score 0. Raw: ${String(response).slice(0, 300)}`);
-          return; // skip this agent, continue with remaining agents
-        }
-        const parsed = JSON.parse(response.trim());
-        if (!parsed.picks || !Array.isArray(parsed.picks)) {
+        const parsed = _extractJSON(response, agent.lens.name);
+        if (!parsed || !parsed.picks || !Array.isArray(parsed.picks)) {
           console.warn(`[Swarm] PARSE SKIP — ${agent.lens.name}: parsed response missing 'picks' array. Agent contributes score 0.`);
           return; // skip this agent, continue with remaining agents
         }
@@ -878,11 +919,8 @@ Rules:
 
   const raw = response.content[0]?.type === 'text' ? response.content[0].text : '';
   // Fail loud: if LLM returns fenced JSON, the prompt is misbehaving — do not silently extract
-  if (raw.includes('```')) {
-    throw new Error(`LLM returned fenced JSON (prompt misbehaving). Check _generateFleetFromLLM prompt. Raw: ${raw.slice(0, 200)}`);
-  }
-  const parsed = JSON.parse(raw.trim());
-  if (!Array.isArray(parsed.agents) || parsed.agents.length === 0) throw new Error('Invalid agents array');
+  const parsed = _extractJSON(raw, '_generateFleetFromLLM');
+  if (!parsed || !Array.isArray(parsed.agents) || parsed.agents.length === 0) throw new Error('Invalid agents array');
 
   // Attach inferred motivation metadata to each agent spec for use by explodeAgentQuestions
   const motivation = parsed.inferred_motivation || '';
@@ -1131,14 +1169,15 @@ Return ONLY a plain JSON array — no code fences, no markdown, no explanation b
     });
 
     const raw = response.content[0]?.type === 'text' ? response.content[0].text : '';
-    // Fail loud: if LLM returns fenced JSON, the prompt is misbehaving — skip agent, do not silently extract
-    if (raw.includes('```')) {
-      console.warn(`[Marble] ${agentName}: LLM returned fenced JSON (prompt misbehaving) — skipping agent (score 0). Raw: ${raw.slice(0, 300)}`);
-      console.warn(`[Marble] ${agentName}: Check explodeAgentQuestions prompt — it must say "no code fences, no markdown"`);
-      return { agent: agentName, questions: [], score: 0, questionsWithData: 0, source: 'fenced_response' };
+    const parsed = _extractJSON(raw, agentName);
+    if (!Array.isArray(parsed)) {
+      if (parsed === null) {
+        console.warn(`[Marble] ${agentName}: LLM returned unparseable response — skipping agent (score 0). Raw: ${raw.slice(0, 300)}`);
+      } else {
+        console.warn(`[Marble] ${agentName}: LLM response is not an array — skipping agent (score 0)`);
+      }
+      return { agent: agentName, questions: [], score: 0, questionsWithData: 0, source: 'parse_failed' };
     }
-    const parsed = JSON.parse(raw.trim());
-    if (!Array.isArray(parsed)) throw new Error('LLM response is not an array');
 
     questions = parsed.slice(0, n).map(q => {
       const rawConf = Math.max(0, Math.min(1, Number(q.confidence) || 0));
