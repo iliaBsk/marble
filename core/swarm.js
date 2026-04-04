@@ -17,6 +17,18 @@
 import { Clone } from './clone.js';
 import { createLLMClient, defaultModel } from './llm-provider.js';
 
+// ── Parse Failure Counter ─────────────────────────────────────
+// Tracks parse failures per agent per process lifetime. Emitted in benchmark output.
+export const parseFailureCounter = {
+  counts: {},
+  increment(agentName) {
+    this.counts[agentName] = (this.counts[agentName] || 0) + 1;
+  },
+  reset() { this.counts = {}; },
+  total() { return Object.values(this.counts).reduce((s, v) => s + v, 0); },
+  report() { return { total: this.total(), byAgent: { ...this.counts } }; }
+};
+
 // ── Agent Definitions ──────────────────────────────────────────
 
 const AGENT_LENSES = {
@@ -96,7 +108,7 @@ class SwarmAgent {
       ),
       '',
       'Pick your top 5 stories. For each, explain WHY this user needs to hear this TODAY.',
-      'Respond with a plain JSON object only — no code fences, no markdown, no explanation before or after.',
+      'Respond with ONLY a JSON object. No markdown fences, no explanation text.',
       'Format: { "picks": [{ "index": N, "score": 0-1, "reason": "..." }] }'
     ].join('\n');
   }
