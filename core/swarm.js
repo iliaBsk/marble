@@ -368,7 +368,8 @@ export class Swarm {
           // Key alias fallback: LLMs (especially Contrarian/Timing) sometimes use wrong key names
           const PICKS_ALIASES = [
             'recommendations', 'selections', 'results', 'stories', 'items',
-            'top_stories', 'top', 'choices', 'analysis', 'signals', 'today'
+            'top_stories', 'top', 'choices', 'analysis', 'signals', 'today',
+            'articles', 'ranked', 'list', 'output'
           ];
           let remapped = false;
           for (const alias of PICKS_ALIASES) {
