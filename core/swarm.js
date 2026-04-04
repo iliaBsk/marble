@@ -357,9 +357,15 @@ export class Swarm {
 
       try {
         const parsed = _extractJSON(response, agent.lens.name);
-        if (!parsed || !parsed.picks || !Array.isArray(parsed.picks)) {
-          console.warn(`[Swarm] PARSE SKIP — ${agent.lens.name}: parsed response missing 'picks' array. Agent contributes score 0.`);
-          return; // skip this agent, continue with remaining agents
+        if (!parsed) {
+          console.warn(`[Swarm] PARSE SKIP — ${agent.lens.name}: _extractJSON returned null (unparseable response). Agent contributes score 0.`);
+          console.warn(`[Swarm] PARSE SKIP — ${agent.lens.name}: raw response snippet: ${String(response).slice(0, 300)}`);
+          return;
+        }
+        if (!parsed.picks || !Array.isArray(parsed.picks)) {
+          console.warn(`[Swarm] PARSE SKIP — ${agent.lens.name}: parsed response missing 'picks' array (got keys: ${Object.keys(parsed).join(', ')}). Agent contributes score 0.`);
+          console.warn(`[Swarm] PARSE SKIP — ${agent.lens.name}: raw response snippet: ${String(response).slice(0, 300)}`);
+          return;
         }
         for (const pick of parsed.picks || []) {
           const story = stories[pick.index - 1];

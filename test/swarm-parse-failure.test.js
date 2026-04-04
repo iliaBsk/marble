@@ -1,11 +1,10 @@
 /**
  * swarm-parse-failure.test.js
  *
- * Verifies that swarm agents fail loud (skip + score 0, no heuristic fallback)
- * when the LLM returns fenced JSON or unparseable output.
+ * Verifies swarm agent JSON parsing behavior (Fix 4: cascading extraction).
  *
- * These tests make the previously-silent heuristic fallback visible:
- * if they fail, it means a prompt is misbehaving and needs to be fixed.
+ * Fenced JSON is now recovered via cascading extraction — score > 0, source 'llm'.
+ * Completely unparseable output still fails loud — score 0, source 'parse_failed'.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -71,22 +70,21 @@ function clearWarnings() {
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 
-describe('swarm parse-failure: fail loud, no heuristic fallback', () => {
+describe('swarm parse-failure: cascading extraction (Fix 4)', () => {
 
-  it('explodeAgentQuestions: fenced JSON → score 0, source fenced_response, warning logged', async () => {
+  it('explodeAgentQuestions: fenced JSON → extracted successfully, score > 0, source llm, no warning', async () => {
     clearWarnings();
     const fencedResponse = '```json\n[{"question":"Is it relevant?","fired":true,"confidence":0.9,"evidence":"test"}]\n```';
     const mockLlm = makeMockClient(fencedResponse);
 
     const result = await explodeAgentQuestions(AGENT_SPEC, CONTENT_SAMPLE, KG_SUMMARY, mockLlm, { forceLLM: true });
 
-    assert.equal(result.score, 0, 'score must be 0 when LLM returns fenced JSON');
-    assert.equal(result.source, 'fenced_response', 'source must be fenced_response');
-    assert.equal(result.questions.length, 0, 'no questions should be populated');
+    assert.equal(result.source, 'llm', 'source must be llm — fenced JSON is now extracted, not rejected');
+    assert.ok(result.score > 0, `score must be > 0 when fenced JSON is successfully extracted (got ${result.score})`);
+    assert.ok(result.questions.length > 0, 'questions should be populated after successful extraction');
 
-    const fencedWarn = warnMessages.find(m => m.includes('fenced JSON'));
-    assert.ok(fencedWarn, `Expected a console.warn about fenced JSON. Got: ${JSON.stringify(warnMessages)}`);
-    assert.ok(fencedWarn.includes('test_agent'), 'Warning must name the agent');
+    const fencedWarn = warnMessages.find(m => m.includes('fenced JSON') && m.includes('test_agent'));
+    assert.equal(fencedWarn, undefined, `No fenced-JSON warning expected for successful extraction, got: ${fencedWarn}`);
   });
 
   it('explodeAgentQuestions: invalid JSON → score 0, source parse_failed, warning logged', async () => {
@@ -100,7 +98,7 @@ describe('swarm parse-failure: fail loud, no heuristic fallback', () => {
     assert.equal(result.source, 'parse_failed', 'source must be parse_failed');
     assert.equal(result.questions.length, 0, 'no questions should be populated');
 
-    const parseWarn = warnMessages.find(m => m.includes('failed to parse'));
+    const parseWarn = warnMessages.find(m => m.includes('test_agent') && (m.includes('unparseable') || m.includes('parse') || m.includes('failed')));
     assert.ok(parseWarn, `Expected a console.warn about parse failure. Got: ${JSON.stringify(warnMessages)}`);
     assert.ok(parseWarn.includes('test_agent'), 'Warning must name the agent');
   });
@@ -124,7 +122,7 @@ describe('swarm parse-failure: fail loud, no heuristic fallback', () => {
     assert.equal(anyWarn, undefined, `No warning expected for valid response, got: ${anyWarn}`);
   });
 
-  it('Swarm#deepEvaluation: fenced JSON → all agents skipped, warning logged, curate returns empty', async () => {
+  it('Swarm#deepEvaluation: fenced JSON → extracted by Fix 4, agents score picks, curate returns results', async () => {
     clearWarnings();
     const fencedResponse = '```json\n{"picks":[{"index":1,"score":0.9,"reason":"great"}]}\n```';
 
@@ -150,11 +148,12 @@ describe('swarm parse-failure: fail loud, no heuristic fallback', () => {
 
     const result = await swarm.curate(stories);
 
-    // All agents should skip (fenced response) → consensus is empty
-    assert.equal(result.length, 0, 'curate result should be empty when all agents skipped due to fenced JSON');
+    // Fix 4: fenced JSON is extracted, agents score picks → curate returns results
+    assert.ok(result.length > 0, `curate result should be non-empty when fenced JSON is extracted (Fix 4). Got length: ${result.length}`);
 
-    const fencedWarn = warnMessages.find(m => m.includes('fenced JSON'));
-    assert.ok(fencedWarn, `Expected a console.warn about fenced JSON from Swarm#deepEvaluation. Got: ${JSON.stringify(warnMessages)}`);
+    // Fix 4 logs fence-extraction as a soft warning (counted failure), not a hard skip
+    const fencedWarn = warnMessages.find(m => m.includes('fence'));
+    assert.ok(fencedWarn, `Expected a console.warn about fenced extraction. Got: ${JSON.stringify(warnMessages)}`);
   });
 
 });
