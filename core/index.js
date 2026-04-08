@@ -98,7 +98,7 @@ export {
   generateAgentFleet, invalidateFleetCache, getFleetCacheStats,
   explodeAgentQuestions,
 } from './swarm.js';
-export { ClonePopulation, evaluateFitness } from './evolution.js';
+export { ClonePopulation } from './evolution.js';
 export { SignalProcessor } from './signals.js';
 export { Observer } from './observer.js';
 export { SCORE_WEIGHTS, ARC_SLOTS } from './types.js';
