@@ -386,11 +386,20 @@ export const CALIBRATION_STATUS = {
 
 // Metric-agnostic use case configurations (extended)
 /**
+ * @typedef {Object} KGOverrides
+ * @property {Array<{topic:string, value:string, confidence:number}>} beliefs
+ * @property {Array<{category:string, value:string, strength:number}>} preferences
+ * @property {Array<{role:string, value:string, salience:number}>} identities
+ */
+
+/**
  * @typedef {Object} UserClone
  * @property {string} id
- * @property {string} hypothesis - What unknown preference dimension this clone probes
- * @property {number} confidence - 0–1, updated via Bayesian feedback
- * @property {Array<{contentId:string, predicted:number, actual:number}>} evaluations
+ * @property {string} gap            - The knowledge gap this clone fills (question text)
+ * @property {string} hypothesis     - Concrete hypothesis filling that gap (e.g. "Alex trains for ultra endurance")
+ * @property {KGOverrides} kgOverrides - This clone's belief/preference/identity extensions to the base KG
+ * @property {number} confidence     - 0–1, updated via Bayesian feedback
+ * @property {Array<{signal:string, predicted:boolean, actual:boolean, correct:boolean}>} evaluations
  * @property {string|null} spawnedFrom - parent clone id if bred from a strong clone
  * @property {number} generation
  * @property {number} createdAt

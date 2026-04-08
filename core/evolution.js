@@ -1,301 +1,147 @@
 /**
- * Prism Evolution — Evolutionary Personalization
+ * evolution.js — Archetype clone population management.
  *
- * Evolves clone variants to better predict user behavior.
- * Manages a population of clones with different weight configurations,
- * evaluates their fitness against actual user reactions, and evolves
- * the population to improve predictions over time.
+ * Clones are user archetype hypotheses (gap → kgOverrides), NOT scoring weight configs.
+ * Each clone extends the base KG with its own belief/preference/identity overrides
+ * and makes predictions based on those. Fitness = prediction accuracy.
+ *
+ * Lifecycle:
+ *   - Clone seeded from knowledge gap (see kg.js → seedClones)
+ *   - Each incoming reaction is evaluated against clone's extended KG
+ *   - Confidence rises/falls based on prediction accuracy
+ *   - Clones with confidence < 0.15 after 10+ evaluations are killed
+ *   - Clones with confidence > 0.75 breed one neighbour variant
  */
 
-import { Clone } from './clone.js';
-import { SCORE_WEIGHTS } from './types.js';
-
-/**
- * Clone variant with custom weight configuration for evolutionary testing
- */
-class CloneVariant extends Clone {
-  constructor(kg, weights = null) {
-    super(kg);
-    this.weights = weights || { ...SCORE_WEIGHTS };
-    this.fitness = 0;
-    this.generation = 0;
-    this.id = Math.random().toString(36).substr(2, 9);
-  }
-
-  /**
-   * Clone this variant with potential mutations
-   * @param {number} mutationRate - How much to mutate (0-1)
-   * @returns {CloneVariant} New mutated variant
-   */
-  mutate(mutationRate = 0.1, sampleCount = 50) {
-    const newWeights = {};
-    let totalWeight = 0;
-    const initialWeights = SCORE_WEIGHTS;
-
-    // Mutate each weight with regularization toward prior
-    for (const [key, value] of Object.entries(this.weights)) {
-      const mutation = (Math.random() - 0.5) * 2 * mutationRate;
-      // Pull weight back toward initial value — strength inversely proportional to evidence
-      const regularization = (initialWeights[key] || value) * (1 / Math.sqrt(Math.max(1, sampleCount)));
-      const regularizedValue = value + mutation + ((initialWeights[key] || value) - value) * regularization;
-      newWeights[key] = Math.max(0.01, Math.min(1, regularizedValue)); // min 0.01 to prevent zero weights
-      totalWeight += newWeights[key];
-    }
-
-    // Normalize weights to maintain relative proportions
-    for (const key of Object.keys(newWeights)) {
-      newWeights[key] = newWeights[key] / totalWeight;
-    }
-
-    const variant = new CloneVariant(this.kg, newWeights);
-    variant.generation = this.generation + 1;
-    return variant;
-  }
-
-  /**
-   * Custom engagement prediction using evolved weights
-   * @param {Object} story - Story to evaluate
-   * @returns {number} Engagement probability (0-1)
-   */
-  wouldEngage(story) {
-    const s = this._snapshot || this.takeSnapshot();
-    let score = 0.1; // base score
-
-    // Topic match weighted by evolved interest_match weight
-    let topicMatch = 0;
-    for (const topic of story.topics || []) {
-      const interest = s.interests[topic];
-      if (interest) {
-        topicMatch = Math.max(topicMatch, interest.weight);
-      }
-    }
-    score += topicMatch * this.weights.interest_match;
-
-    // Temporal relevance (fresher content gets higher weight)
-    const hours = (Date.now() - new Date(story.published_at)) / (1000 * 60 * 60);
-    const freshness = Math.max(0, 1 - hours / 24); // decay over 24 hours
-    score += freshness * this.weights.temporal_relevance;
-
-    // Source trust
-    const trust = s.source_trust[story.source] ?? 0.5;
-    score += trust * this.weights.source_trust;
-
-    // Actionability (if story has actionable content)
-    const actionability = story.actionability ?? 0.3;
-    score += actionability * this.weights.actionability;
-
-    // Novelty (simplified as inverse topic frequency)
-    const novelty = story.novelty ?? 0.5;
-    score += novelty * this.weights.novelty;
-
-    return Math.min(1, score);
-  }
-}
-
-/**
- * Manages a population of clone variants for evolutionary optimization
- */
 export class ClonePopulation {
   /**
-   * @param {KnowledgeGraph} kg - Knowledge graph instance
-   * @param {number} populationSize - Number of clones to maintain
+   * @param {Object} kg   - KnowledgeGraph instance
+   * @param {Function} llmCall - async (prompt: string) => string  (for evaluation)
+   * @param {Object} [opts]
+   * @param {number} [opts.killThreshold=0.15]
+   * @param {number} [opts.minEvaluationsToKill=10]
+   * @param {number} [opts.breedThreshold=0.75]
    */
-  constructor(kg, populationSize = 20) {
+  constructor(kg, llmCall, opts = {}) {
     this.kg = kg;
-    this.populationSize = populationSize;
-    this.variants = [];
-    this.generation = 0;
-    this.fitnessHistory = [];
-
-    this._initializePopulation();
+    this.llmCall = llmCall;
+    this.killThreshold = opts.killThreshold ?? 0.15;
+    this.minEvaluationsToKill = opts.minEvaluationsToKill ?? 10;
+    this.breedThreshold = opts.breedThreshold ?? 0.75;
   }
 
   /**
-   * Initialize population with random weight variations
-   * @private
+   * Evaluate a clone against a new reaction.
+   * The clone extends the base KG with its kgOverrides, makes a prediction,
+   * then we compare that prediction to what actually happened.
+   *
+   * @param {import('./types.js').UserClone} clone
+   * @param {Object} reaction  - { itemId, item, reaction: 'up'|'down'|'share'|'skip' }
+   * @returns {Promise<boolean>} - whether the clone predicted correctly
    */
-  _initializePopulation() {
-    // Start with baseline clone
-    this.variants.push(new CloneVariant(this.kg));
+  async evaluateFitness(clone, reaction) {
+    const { item, reaction: signal } = reaction;
+    if (!item) return false;
 
-    // Generate variants with different weight distributions
-    for (let i = 1; i < this.populationSize; i++) {
-      const weights = {};
-      let total = 0;
+    const actualEngaged = ['up', 'share'].includes(signal);
 
-      // Random weight distribution
-      for (const key of Object.keys(SCORE_WEIGHTS)) {
-        weights[key] = Math.random();
-        total += weights[key];
-      }
+    // Build a description of the clone's extended KG view
+    const overrideDesc = this._describeOverrides(clone.kgOverrides);
 
-      // Normalize
-      for (const key of Object.keys(weights)) {
-        weights[key] = weights[key] / total;
-      }
+    const prompt = `A user with the following profile:
+${overrideDesc}
 
-      this.variants.push(new CloneVariant(this.kg, weights));
+Was shown this item: ${JSON.stringify({ title: item.title, domain: item.domain, tags: item.tags, metadata: item.metadata })}
+
+Would this user engage positively with this item? Answer with ONLY "yes" or "no".`;
+
+    let predictedEngaged = false;
+    try {
+      const answer = (await this.llmCall(prompt)).trim().toLowerCase();
+      predictedEngaged = answer.startsWith('yes');
+    } catch {
+      // If LLM call fails, skip this evaluation
+      return false;
     }
+
+    const correct = predictedEngaged === actualEngaged;
+
+    // Record evaluation on the clone
+    clone.evaluations = clone.evaluations || [];
+    clone.evaluations.push({
+      signal,
+      predicted: predictedEngaged,
+      actual: actualEngaged,
+      correct,
+    });
+    clone.lastScoredAt = Date.now();
+
+    // Update confidence (learning rate 0.1)
+    const lr = 0.1;
+    if (correct) {
+      clone.confidence = Math.min(1, clone.confidence + lr * (1 - clone.confidence));
+    } else {
+      clone.confidence = Math.max(0, clone.confidence - lr * clone.confidence);
+    }
+
+    this.kg.saveClone(clone);
+    return correct;
   }
 
   /**
-   * Evaluate fitness of a clone against actual user reactions
-   * @param {CloneVariant} clone - Clone to evaluate
-   * @param {Array} actualReactions - [{storyId, story, reaction, prediction}]
-   * @returns {number} Fitness score (0-1, higher is better)
+   * Run evolution step: evaluate all active clones against new reactions,
+   * kill weak ones, breed strong ones.
+   *
+   * @param {Array} reactions - Array of reaction objects
+   * @returns {Promise<{ killed: number, bred: number, active: number }>}
    */
-  evaluateFitness(clone, actualReactions) {
-    if (actualReactions.length === 0) return 0.5;
+  async evolve(reactions) {
+    const clones = this.kg.getActiveClones();
 
-    let correct = 0;
-    let total = actualReactions.length;
-
-    for (const { story, reaction, prediction } of actualReactions) {
-      const clonePrediction = clone.wouldEngage(story);
-
-      // Convert reaction to binary engagement
-      const actualEngagement = ['up', 'share'].includes(reaction) ? 1 : 0;
-      const predictedEngagement = clonePrediction > 0.5 ? 1 : 0;
-
-      // Score based on accuracy
-      if (actualEngagement === predictedEngagement) {
-        correct++;
-      }
-
-      // Bonus for confidence alignment
-      const confidence = Math.abs(clonePrediction - 0.5) * 2; // 0-1
-      const actualConfidence = actualEngagement;
-      const confidenceDiff = Math.abs(confidence - actualConfidence);
-      correct += (1 - confidenceDiff) * 0.3; // partial credit
-    }
-
-    return Math.min(1, correct / total);
-  }
-
-  /**
-   * Evolve the population: kill weak clones, mutate survivors, spawn new variants
-   * @param {Array} reactionData - Recent user reactions for fitness evaluation
-   */
-  evolve(reactionData = []) {
-    // Fix 5: minimum sample gate — skip evolution with insufficient data to prevent overfitting
-    if (reactionData.length < 15) {
-      console.log(`[Evolution] Skipping evolve — only ${reactionData.length} reactions (min 15 required)`);
-      return;
-    }
-
-    // Evaluate fitness for all variants
-    for (const variant of this.variants) {
-      variant.fitness = this.evaluateFitness(variant, reactionData);
-    }
-
-    // Sort by fitness (highest first)
-    this.variants.sort((a, b) => b.fitness - a.fitness);
-
-    // Record generation stats
-    const avgFitness = this.variants.reduce((sum, v) => sum + v.fitness, 0) / this.variants.length;
-    const maxFitness = this.variants[0].fitness;
-    this.fitnessHistory.push({ generation: this.generation, avgFitness, maxFitness });
-
-    // Kill bottom 20%
-    const killCount = Math.floor(this.populationSize * 0.2);
-    this.variants = this.variants.slice(0, this.populationSize - killCount);
-
-    // Generate new variants from survivors
-    const survivors = this.variants.slice();
-    while (this.variants.length < this.populationSize) {
-      // Select parent based on fitness-weighted selection
-      const parent = this._selectParent(survivors);
-
-      // Create mutated offspring — scale mutation rate down with sample size to reduce drift
-      const baseMutation = Math.max(0.02, 0.15 - (reactionData.length / 1000));
-      const mutationRate = baseMutation + (baseMutation * 0.5 * Math.random());
-      const offspring = parent.mutate(mutationRate, reactionData.length);
-      this.variants.push(offspring);
-    }
-
-    this.generation++;
-  }
-
-  /**
-   * Select parent for reproduction based on fitness
-   * @param {CloneVariant[]} survivors - Available parents
-   * @returns {CloneVariant} Selected parent
-   * @private
-   */
-  _selectParent(survivors) {
-    // Fitness-proportionate selection (roulette wheel)
-    const totalFitness = survivors.reduce((sum, v) => sum + v.fitness, 0);
-    const rand = Math.random() * totalFitness;
-
-    let accumulated = 0;
-    for (const variant of survivors) {
-      accumulated += variant.fitness;
-      if (accumulated >= rand) {
-        return variant;
+    // Evaluate each clone against each reaction
+    for (const clone of clones) {
+      for (const reaction of reactions) {
+        await this.evaluateFitness(clone, reaction);
       }
     }
 
-    // Fallback to best variant
-    return survivors[0];
+    // Kill weak clones
+    let killed = 0;
+    for (const clone of this.kg.getActiveClones()) {
+      if (
+        clone.evaluations.length >= this.minEvaluationsToKill &&
+        clone.confidence < this.killThreshold
+      ) {
+        this.kg.killClone(clone.id);
+        killed++;
+      }
+    }
+
+    // Breed strong clones (requires llm client, handled by kg.breedStrongClones)
+    // We just return stats here; caller should invoke kg.breedStrongClones if desired.
+    const active = this.kg.getActiveClones().length;
+
+    return { killed, active };
   }
 
   /**
-   * Get the highest-fitness clone for production use
-   * @returns {CloneVariant} Best performing clone
+   * Get the highest-confidence active clone.
+   * @returns {import('./types.js').UserClone|null}
    */
   getBestClone() {
-    if (this.variants.length === 0) return null;
-
-    return this.variants.reduce((best, current) =>
-      current.fitness > best.fitness ? current : best
-    );
+    const clones = this.kg.getActiveClones();
+    if (!clones.length) return null;
+    return clones.reduce((best, c) => c.confidence > best.confidence ? c : best);
   }
 
-  /**
-   * Get population statistics
-   * @returns {Object} Stats about current population
-   */
-  getStats() {
-    const fitness = this.variants.map(v => v.fitness);
-    return {
-      generation: this.generation,
-      populationSize: this.variants.length,
-      avgFitness: fitness.reduce((sum, f) => sum + f, 0) / fitness.length,
-      maxFitness: Math.max(...fitness),
-      minFitness: Math.min(...fitness),
-      diversityScore: this._calculateDiversity()
-    };
+  // ── Private ──────────────────────────────────────────
+
+  _describeOverrides(kgOverrides) {
+    if (!kgOverrides) return '(no overrides)';
+    const lines = [];
+    for (const b of kgOverrides.beliefs || [])     lines.push(`Belief: ${b.topic} = ${b.value}`);
+    for (const p of kgOverrides.preferences || []) lines.push(`Preference: ${p.category} = ${p.value}`);
+    for (const id of kgOverrides.identities || []) lines.push(`Identity: ${id.role} = ${id.value}`);
+    return lines.join('\n') || '(no overrides)';
   }
-
-  /**
-   * Calculate weight diversity across population
-   * @returns {number} Diversity score (0-1, higher is more diverse)
-   * @private
-   */
-  _calculateDiversity() {
-    if (this.variants.length < 2) return 0;
-
-    const weightKeys = Object.keys(SCORE_WEIGHTS);
-    let totalVariance = 0;
-
-    for (const key of weightKeys) {
-      const values = this.variants.map(v => v.weights[key]);
-      const mean = values.reduce((sum, v) => sum + v, 0) / values.length;
-      const variance = values.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / values.length;
-      totalVariance += variance;
-    }
-
-    return Math.min(1, totalVariance * weightKeys.length * 4); // normalized diversity
-  }
-}
-
-/**
- * Utility function for standalone fitness evaluation
- * @param {CloneVariant} clone - Clone to evaluate
- * @param {Array} actualReactions - User reaction data
- * @returns {number} Fitness score
- */
-export function evaluateFitness(clone, actualReactions) {
-  const population = new ClonePopulation(clone.kg, 1);
-  return population.evaluateFitness(clone, actualReactions);
 }

@@ -108,7 +108,7 @@ export { CollaborativeFilter } from './collaborative-filter.js';
 
 // Domain-agnostic knowledge extraction
 export { extractEntityAttributes, attributeCount } from './entity-extractor.js';
-export { detectDomain as detectItemDomain, getDomainSchema, getDomainDimensions, getDimension, DOMAINS } from './domain-schemas.js';
+export { detectDomain as detectItemDomain, getDomainSchema, DOMAINS } from './domain-schemas.js';
 
 // L1.5 Insight Mining Swarm
 export { runInsightSwarm, getL2Seeds } from './insight-swarm.js';
@@ -122,8 +122,8 @@ export { SimulationQueue } from './simulation-queue.js';
 // Topic Insight Engine (LLM-powered preference learning)
 export { TopicInsightEngine, GapSimulator } from './topic-insight-engine.js';
 
-// Secondary context collection (question-driven)
-export { QuestionEngine } from './question-engine.js';
+// Investigative Committee (replaces QuestionEngine)
+export { InvestigativeCommittee } from './investigative-committee.js';
 
 // Use-case profiles and scorer factory
 export { USE_CASE_PROFILES, createProfileConfig, createScorerForUseCase } from './use-case-profiles.js';

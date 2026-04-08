@@ -191,24 +191,4 @@ export class SignalProcessor {
     return this.signals.size;
   }
 
-  // ── Post-Rating Context Collection Hooks ────────────
-
-  /**
-   * Hook: after a rating is recorded, trigger secondary context collection.
-   * Connects to QuestionEngine for follow-up questions and implicit extraction.
-   * @param {Object} questionEngine - QuestionEngine instance
-   * @param {Object} item - Rated item
-   * @param {number|string} rating - User's rating
-   * @param {Object} [opts] - Options for question generation
-   * @returns {{ questions: Array, implicitExtracted: boolean }}
-   */
-  onPostRating(questionEngine, item, rating, opts = {}) {
-    // Generate follow-up questions
-    const questions = questionEngine.generateFollowUpQuestions(item, rating, opts);
-
-    // Always run implicit extraction (no user input needed)
-    questionEngine.extractImplicitContext(item, rating);
-
-    return { questions, implicitExtracted: true };
-  }
 }
