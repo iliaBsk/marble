@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Set up your Marble profile</title>
+  <link rel="stylesheet" href="/onboarding/onboarding.css" />
+</head>
+<body>
+  <header class="onboarding-header">
+    <div class="onboarding-logo">marble</div>
+    <p class="onboarding-tagline">Let's learn what matters to you.</p>
+  </header>
+
+  <div class="progress-bar-container">
+    <div class="progress-bar-track">
+      <div class="progress-bar-fill" id="progress-fill" style="width:0%"></div>
+    </div>
+    <p class="progress-label" id="progress-label">Step 1</p>
+  </div>
+
+  <main id="wizard" aria-live="polite"></main>
+
+  <script type="module" src="/onboarding/wizard.js"></script>
+</body>
+</html>

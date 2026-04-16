@@ -315,6 +315,26 @@ export class Marble {
   }
 
   /**
+   * Zero-day onboarding: seed the KG from wizard answers + optional deep research.
+   * Call once for a new user before any select()/react() calls.
+   *
+   * @param {import('./onboarding/schema.js').OnboardingAnswers} answers
+   * @param {object} [opts]
+   * @param {boolean} [opts.deepResearch=true]
+   * @param {object} [opts.llmClient] - Injected OpenAI client (for testing)
+   * @param {AbortSignal} [opts.signal]
+   * @param {(stage:string, payload?:object)=>void} [opts.onProgress]
+   * @returns {Promise<import('./onboarding/index.js').OnboardingResult>}
+   */
+  async onboard(answers, opts = {}) {
+    if (!this.ready) await this.init();
+    const { onboardUser } = await import('./onboarding/index.js');
+    const result = await onboardUser(this.kg, answers, opts);
+    await this.kg.save();
+    return result;
+  }
+
+  /**
    * Update user context (calendar, projects, etc.)
    */
   setContext(context) {
@@ -357,3 +377,8 @@ export { MemoryLayers } from './memory-layers.js';
 // ═══════════════════════════════════════════════════════════
 export { SCORE_WEIGHTS, ARC_SLOTS } from './types.js';
 export { USE_CASE_PROFILES, createProfileConfig } from './use-case-profiles.js';
+
+// ═══════════════════════════════════════════════════════════
+// TIER 5: Onboarding
+// ═══════════════════════════════════════════════════════════
+export { onboardUser, STEPS, getStep, getShopsForCity, getKnownCities } from './onboarding/index.js';
