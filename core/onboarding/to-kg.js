@@ -116,9 +116,11 @@ export function answersToKgSeed(answers) {
   // ── Values fingerprint ──
   if (answers.valuesFingerprint) {
     const vf = answers.valuesFingerprint;
+    // Precondition: all 3 sub-keys are valid strings (guaranteed by validateOnboardingAnswers)
     seed.beliefs.push({ topic: 'value:speed_vs_depth',           claim: vf.speedVsDepth,            strength: 0.7 });
     seed.beliefs.push({ topic: 'value:stability_vs_opportunity', claim: vf.stabilityVsOpportunity,  strength: 0.7 });
     seed.beliefs.push({ topic: 'value:local_vs_global',          claim: vf.localVsGlobal,            strength: 0.7 });
+    // OCEAN proxies: conscientiousness←speedVsDepth, openness←stabilityVsOpportunity (per design spec)
     seed.preferences.push({ type: 'ocean_conscientiousness', description: vf.speedVsDepth,            strength: 0.5 });
     seed.preferences.push({ type: 'ocean_openness',          description: vf.stabilityVsOpportunity,  strength: 0.5 });
   }
