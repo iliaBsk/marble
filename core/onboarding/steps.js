@@ -45,7 +45,7 @@ import {
 
 /** @param {string[]} values @param {(v:string)=>string} [labelFn] @returns {StepOption[]} */
 const opts = (values, labelFn) =>
-  values.map(v => ({ value: v, label: labelFn ? labelFn(v) : toLabel(v) }));
+  values.map(v => ({ value: v, label: labelFn ? (labelFn(v) ?? toLabel(v)) : toLabel(v) }));
 
 /** Convert snake/kebab-case to Title Case label */
 function toLabel(v) {
