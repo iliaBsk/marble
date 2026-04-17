@@ -12,11 +12,13 @@
  * @property {string} time_horizon
  */
 
+const sanitizeCtx = (v) => String(v || 'unknown').replace(/[\n\r"]/g, ' ').slice(0, 40);
+
 const PROMPT_TEMPLATE = (text, context) =>
   `Analyze this user statement and return JSON only.
 
 User statement: "${text.replace(/"/g, '\\"').slice(0, 120)}"
-User context: role=${context.role || 'unknown'}, ageBracket=${context.ageBracket || 'unknown'}
+User context: role=${sanitizeCtx(context.role)}, ageBracket=${sanitizeCtx(context.ageBracket)}
 
 Return exactly this JSON structure with no other text:
 {
@@ -39,22 +41,31 @@ export async function classifyJtbd(text, context = {}, client = null) {
   if (!client && !process.env.ANTHROPIC_API_KEY) return null;
 
   try {
-    if (!client) {
+    let resolvedClient = client;
+    if (!resolvedClient) {
       const { default: Anthropic } = await import('@anthropic-ai/sdk');
-      client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+      resolvedClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
     }
 
-    const response = await client.messages.create({
+    const response = await resolvedClient.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 256,
       messages: [{ role: 'user', content: PROMPT_TEMPLATE(text, context) }],
     });
 
     const raw = response.content[0].text.trim();
-    const match = raw.match(/\{[\s\S]*\}/);
-    if (!match) return null;
+    const start = raw.indexOf('{');
+    if (start === -1) return null;
+    let depth = 0;
+    let end = -1;
+    for (let i = start; i < raw.length; i++) {
+      if (raw[i] === '{') depth++;
+      else if (raw[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
+    }
+    if (end === -1) return null;
 
-    const parsed = JSON.parse(match[0]);
+    let parsed;
+    try { parsed = JSON.parse(raw.slice(start, end + 1)); } catch { return null; }
     if (!parsed.jtbd_category || !Array.isArray(parsed.topic_clusters)) return null;
 
     return {
