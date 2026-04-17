@@ -73,6 +73,33 @@ async function renderStep(index) {
     control = toggle;
     card.appendChild(toggle.element);
 
+    // Optional age bracket sub-field (maritalStatus step only)
+    if (step.ageBracket) {
+      const ageLabel = document.createElement('p');
+      ageLabel.className = 'step-subtitle';
+      ageLabel.style.marginTop = '1.5rem';
+      ageLabel.textContent = 'Your age range (optional)';
+      card.appendChild(ageLabel);
+
+      const ageChips = createChipGroup({
+        options: step.ageBracket.options,
+        multi: false,
+        name: 'ageBracket',
+      });
+      if (answers.ageBracket) ageChips.setValue(answers.ageBracket);
+      card.appendChild(ageChips.element);
+
+      // Wrap original control to also capture ageBracket
+      const originalControl = control;
+      control = {
+        getValue: () => {
+          const bracketVal = ageChips.getValue();
+          if (bracketVal && bracketVal.length > 0) answers.ageBracket = Array.isArray(bracketVal) ? bracketVal[0] : bracketVal;
+          return originalControl.getValue();
+        },
+      };
+    }
+
   } else if (step.kind === 'chips') {
     let options = step.options;
 
@@ -127,21 +154,73 @@ async function renderStep(index) {
     const textarea = document.createElement('textarea');
     textarea.className = 'freeform-input';
     textarea.placeholder = 'Type here… (optional)';
-    textarea.maxLength = 280;
+    textarea.maxLength = 120;
     if (answers.freeform) textarea.value = answers.freeform;
 
     const counter = document.createElement('p');
     counter.className = 'freeform-count';
-    counter.textContent = `0 / 280`;
+    counter.textContent = `0 / 120`;
 
     textarea.addEventListener('input', () => {
-      counter.textContent = `${textarea.value.length} / 280`;
+      counter.textContent = `${textarea.value.length} / 120`;
     });
 
     card.appendChild(textarea);
     card.appendChild(counter);
 
     control = { getValue: () => textarea.value || undefined };
+
+  } else if (step.kind === 'pairs') {
+    const pairAnswers = answers[step.id] || {};
+    const pairEls = {};
+
+    for (const pair of step.pairs) {
+      const row = document.createElement('div');
+      row.className = 'pairs-row';
+
+      const btnA = document.createElement('button');
+      btnA.className = 'pairs-btn';
+      btnA.dataset.pairId = pair.id;
+      btnA.dataset.value = pair.labelA.toLowerCase();
+      btnA.textContent = pair.labelA;
+
+      const sep = document.createElement('span');
+      sep.className = 'pairs-sep';
+      sep.textContent = 'vs';
+
+      const btnB = document.createElement('button');
+      btnB.className = 'pairs-btn';
+      btnB.dataset.pairId = pair.id;
+      btnB.dataset.value = pair.labelB.toLowerCase();
+      btnB.textContent = pair.labelB;
+
+      const selectBtn = (active, inactive) => {
+        active.classList.add('selected');
+        inactive.classList.remove('selected');
+        pairAnswers[pair.id] = active.dataset.value;
+      };
+
+      btnA.addEventListener('click', () => selectBtn(btnA, btnB));
+      btnB.addEventListener('click', () => selectBtn(btnB, btnA));
+
+      // Restore prior selection
+      if (pairAnswers[pair.id] === pair.labelA.toLowerCase()) btnA.classList.add('selected');
+      else if (pairAnswers[pair.id] === pair.labelB.toLowerCase()) btnB.classList.add('selected');
+
+      row.appendChild(btnA);
+      row.appendChild(sep);
+      row.appendChild(btnB);
+      card.appendChild(row);
+      pairEls[pair.id] = { btnA, btnB };
+    }
+
+    control = {
+      getValue: () => {
+        // All pairs must be answered
+        if (step.pairs.every(p => pairAnswers[p.id] !== undefined)) return { ...pairAnswers };
+        return undefined;
+      },
+    };
   }
 
   // Navigation
