@@ -11,7 +11,7 @@ import {
   AGE_BRACKET_OPTIONS,
 } from '../core/onboarding/schema.js';
 import { answersToKgSeed } from '../core/onboarding/to-kg.js';
-import { applyOnboardingToKg } from '../core/onboarding/apply-to-kg.js';
+import { applyOnboardingToKg, applyEnrichmentToKg, applyPersonaEnrichment } from '../core/onboarding/apply-to-kg.js';
 import { getShopsForCity, getKnownCities } from '../core/onboarding/shops-registry.js';
 import { STEPS, getStep } from '../core/onboarding/steps.js';
 import { getTopicInterestsForPassions } from '../core/onboarding/wikidata.js';
@@ -578,5 +578,64 @@ describe('wikidata — getTopicInterestsForPassions', () => {
 
   test('returns empty array for empty input', () => {
     assert.deepEqual(getTopicInterestsForPassions([]), []);
+  });
+});
+
+describe('applyPersonaEnrichment', () => {
+  test('writes NLP classification beliefs to KG when provided', async () => {
+    const kg = makeMockKg();
+    const mockClassify = async () => ({
+      jtbd_category: 'build_something',
+      topic_clusters: ['startup', 'product'],
+      urgency_score: 8,
+      time_horizon: 'immediate',
+    });
+    await applyPersonaEnrichment(kg, { freeform: 'launch my MVP' }, { classifyFn: mockClassify });
+
+    const jtbdCat = kg._store.beliefs.find(b => b.topic === 'jtbd:category');
+    assert.ok(jtbdCat, 'jtbd:category belief missing');
+    assert.equal(jtbdCat.claim, 'build_something');
+
+    const urgency = kg._store.beliefs.find(b => b.topic === 'jtbd:urgency');
+    assert.ok(urgency, 'jtbd:urgency belief missing');
+    assert.equal(urgency.claim, '8');
+
+    const clusterInterest = kg._store.interests['cluster:startup'];
+    assert.ok(clusterInterest > 0, 'cluster interest missing');
+  });
+
+  test('skips NLP when freeform is absent', async () => {
+    const kg = makeMockKg();
+    let called = false;
+    const mockClassify = async () => { called = true; return null; };
+    await applyPersonaEnrichment(kg, {}, { classifyFn: mockClassify });
+    assert.equal(called, false);
+  });
+
+  test('does not throw when NLP returns null', async () => {
+    const kg = makeMockKg();
+    const mockClassify = async () => null;
+    await assert.doesNotReject(
+      applyPersonaEnrichment(kg, { freeform: 'some text' }, { classifyFn: mockClassify })
+    );
+  });
+
+  test('writes Wikidata static QID interests when passions present', async () => {
+    const kg = makeMockKg();
+    await applyPersonaEnrichment(kg, { passions: ['technology'] }, {
+      wikidataFn: async (kgArg, passions) => {
+        kgArg.boostInterest('wikidata:Q11661', 0.5);
+      },
+    });
+    assert.ok(kg._store.interests['wikidata:Q11661'] > 0);
+  });
+
+  test('skips Wikidata when passions absent', async () => {
+    const kg = makeMockKg();
+    let called = false;
+    await applyPersonaEnrichment(kg, {}, {
+      wikidataFn: async () => { called = true; },
+    });
+    assert.equal(called, false);
   });
 });

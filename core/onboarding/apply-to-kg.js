@@ -115,3 +115,49 @@ export function applyEnrichmentToKg(kg, enrichment) {
  * @property {Record<string,number>} [confidence]
  * @property {string[]} [citations]
  */
+
+/**
+ * Fire-and-forget async enrichment: NLP classification + Wikidata linking.
+ * Both are best-effort — failures are swallowed, KG is not rolled back.
+ *
+ * @param {import('../kg.js').KnowledgeGraph} kg
+ * @param {Partial<import('./schema.js').OnboardingAnswers>} answers
+ * @param {{ classifyFn?: Function, wikidataFn?: Function }} [opts]
+ */
+export async function applyPersonaEnrichment(kg, answers, opts = {}) {
+  const {
+    classifyFn = null,
+    wikidataFn = null,
+  } = opts;
+
+  // ── NLP: classify freeform JTBD text ──
+  if (answers.freeform && answers.freeform.trim()) {
+    try {
+      const classify = classifyFn ?? (await import('./nlp-pipeline.js')).classifyJtbd;
+      const result = await classify(answers.freeform, {
+        role: answers.professional,
+        ageBracket: answers.ageBracket,
+      });
+      if (result) {
+        kg.addBelief('jtbd:category', result.jtbd_category, 0.8);
+        kg.addBelief('jtbd:urgency',  String(result.urgency_score), 0.7);
+        for (const cluster of result.topic_clusters) {
+          const topic = `cluster:${cluster.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
+          kg.boostInterest(topic, 0.6);
+        }
+      }
+    } catch {
+      // NLP enrichment is best-effort
+    }
+  }
+
+  // ── Wikidata: link passion QIDs ──
+  if (answers.passions && answers.passions.length > 0) {
+    try {
+      const enrich = wikidataFn ?? (await import('./wikidata.js')).enrichWithWikidata;
+      await enrich(kg, answers.passions);
+    } catch {
+      // Wikidata enrichment is best-effort
+    }
+  }
+}
