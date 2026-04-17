@@ -1,0 +1,69 @@
+/**
+ * JTBD intent classification for onboarding freeform text.
+ * Uses Claude Haiku for speed and cost efficiency.
+ * Accepts an injected client for testing.
+ */
+
+/**
+ * @typedef {Object} JtbdClassification
+ * @property {string} jtbd_category
+ * @property {string[]} topic_clusters
+ * @property {number} urgency_score
+ * @property {string} time_horizon
+ */
+
+const PROMPT_TEMPLATE = (text, context) =>
+  `Analyze this user statement and return JSON only.
+
+User statement: "${text.replace(/"/g, '\\"').slice(0, 120)}"
+User context: role=${context.role || 'unknown'}, ageBracket=${context.ageBracket || 'unknown'}
+
+Return exactly this JSON structure with no other text:
+{
+  "jtbd_category": "grow_income|protect_assets|manage_costs|build_something|personal_development",
+  "topic_clusters": ["topic1", "topic2"],
+  "urgency_score": 0,
+  "time_horizon": "immediate|short_term|long_term"
+}`;
+
+/**
+ * Classifies freeform JTBD text using Claude Haiku.
+ * Returns null on any failure — callers should treat null as "classification unavailable".
+ *
+ * @param {string} text
+ * @param {{ role?: string, ageBracket?: string }} context
+ * @param {object|null} [client] - injected Anthropic client (for tests); created from env if null
+ * @returns {Promise<JtbdClassification|null>}
+ */
+export async function classifyJtbd(text, context = {}, client = null) {
+  if (!client && !process.env.ANTHROPIC_API_KEY) return null;
+
+  try {
+    if (!client) {
+      const { default: Anthropic } = await import('@anthropic-ai/sdk');
+      client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    }
+
+    const response = await client.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 256,
+      messages: [{ role: 'user', content: PROMPT_TEMPLATE(text, context) }],
+    });
+
+    const raw = response.content[0].text.trim();
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return null;
+
+    const parsed = JSON.parse(match[0]);
+    if (!parsed.jtbd_category || !Array.isArray(parsed.topic_clusters)) return null;
+
+    return {
+      jtbd_category:  String(parsed.jtbd_category),
+      topic_clusters: parsed.topic_clusters.map(String),
+      urgency_score:  Number(parsed.urgency_score) || 0,
+      time_horizon:   String(parsed.time_horizon || 'short_term'),
+    };
+  } catch {
+    return null;
+  }
+}
