@@ -14,6 +14,7 @@ import { answersToKgSeed } from '../core/onboarding/to-kg.js';
 import { applyOnboardingToKg } from '../core/onboarding/apply-to-kg.js';
 import { getShopsForCity, getKnownCities } from '../core/onboarding/shops-registry.js';
 import { STEPS, getStep } from '../core/onboarding/steps.js';
+import { getTopicInterestsForPassions } from '../core/onboarding/wikidata.js';
 
 // ── Fixtures ─────────────────────────────────────────────────
 
@@ -549,5 +550,33 @@ describe('STEPS array — new persona steps', () => {
     assert.ok(step.title.includes('improve') || step.title.includes('solve'), 'freeform title not updated');
     assert.equal(step.maxLength, 120);
     assert.equal(step.nlp, true);
+  });
+});
+
+describe('wikidata — getTopicInterestsForPassions', () => {
+  test('returns interest nodes for known passions', () => {
+    const interests = getTopicInterestsForPassions(['technology', 'travel']);
+    assert.ok(interests.length >= 2, `expected ≥2 interests, got ${interests.length}`);
+    assert.ok(interests.every(i => i.topic.startsWith('wikidata:')));
+    assert.ok(interests.every(i => typeof i.amount === 'number' && i.amount > 0));
+  });
+
+  test('maps technology to Q11661', () => {
+    const interests = getTopicInterestsForPassions(['technology']);
+    assert.ok(interests.some(i => i.topic === 'wikidata:Q11661'));
+  });
+
+  test('maps travel to Q61509', () => {
+    const interests = getTopicInterestsForPassions(['travel']);
+    assert.ok(interests.some(i => i.topic === 'wikidata:Q61509'));
+  });
+
+  test('returns empty array for unknown passion', () => {
+    const interests = getTopicInterestsForPassions(['unknown-passion']);
+    assert.deepEqual(interests, []);
+  });
+
+  test('returns empty array for empty input', () => {
+    assert.deepEqual(getTopicInterestsForPassions([]), []);
   });
 });
