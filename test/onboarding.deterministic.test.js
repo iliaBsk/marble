@@ -392,4 +392,14 @@ describe('validateOnboardingAnswers — new persona fields', () => {
     assert.ok(PASSION_OPTIONS.includes('technology'));
     assert.ok(PASSION_OPTIONS.includes('arts-culture'));
   });
+
+  test('exports FINANCIAL_MINDSET_OPTIONS with 4 entries', () => {
+    assert.equal(FINANCIAL_MINDSET_OPTIONS.length, 4);
+    assert.ok(FINANCIAL_MINDSET_OPTIONS.includes('grow_income'));
+  });
+
+  test('exports AGE_BRACKET_OPTIONS with 5 entries', () => {
+    assert.equal(AGE_BRACKET_OPTIONS.length, 5);
+    assert.ok(AGE_BRACKET_OPTIONS.includes('60s+'));
+  });
 });

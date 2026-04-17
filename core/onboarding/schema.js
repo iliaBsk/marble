@@ -165,7 +165,7 @@ export function validateOnboardingAnswers(input) {
   }
 
   if (a.valuesFingerprint !== undefined) {
-    if (!a.valuesFingerprint || typeof a.valuesFingerprint !== 'object') {
+    if (!a.valuesFingerprint || typeof a.valuesFingerprint !== 'object' || Array.isArray(a.valuesFingerprint)) {
       errors.push('valuesFingerprint must be an object');
     } else {
       const vf = /** @type {Record<string,unknown>} */ (a.valuesFingerprint);
