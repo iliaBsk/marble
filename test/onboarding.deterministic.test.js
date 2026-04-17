@@ -405,6 +405,98 @@ describe('validateOnboardingAnswers — new persona fields', () => {
   });
 });
 
+describe('answersToKgSeed — new persona fields', () => {
+  const seed = answersToKgSeed(PERSONA_ANSWERS);
+
+  test('produces professional_role identity', () => {
+    const id = seed.identities.find(i => i.role === 'professional_role');
+    assert.ok(id, 'professional_role identity missing');
+    assert.equal(id.context, 'founder');
+    assert.ok(id.salience >= 0.9);
+  });
+
+  test('removes gap:profession when professional is present', () => {
+    assert.ok(!seed.gaps.some(g => g.topic === 'gap:profession'), 'gap:profession should be removed');
+  });
+
+  test('still includes gap:profession when professional is absent', () => {
+    const seedWithout = answersToKgSeed(VALID_ANSWERS);
+    assert.ok(seedWithout.gaps.some(g => g.topic === 'gap:profession'));
+  });
+
+  test('produces wealth_mindset identity', () => {
+    const id = seed.identities.find(i => i.role === 'wealth_mindset');
+    assert.ok(id, 'wealth_mindset identity missing');
+    assert.equal(id.context, 'grow_income');
+    assert.ok(id.salience >= 0.7);
+  });
+
+  test('removes gap:income_bracket when financialMindset is present', () => {
+    assert.ok(!seed.gaps.some(g => g.topic === 'gap:income_bracket'), 'gap:income_bracket should be removed');
+  });
+
+  test('produces 3 value beliefs from valuesFingerprint', () => {
+    const valueBeliefs = seed.beliefs.filter(b => b.topic.startsWith('value:'));
+    assert.equal(valueBeliefs.length, 3);
+    assert.ok(valueBeliefs.some(b => b.topic === 'value:speed_vs_depth' && b.claim === 'speed'));
+    assert.ok(valueBeliefs.some(b => b.topic === 'value:stability_vs_opportunity' && b.claim === 'opportunity'));
+    assert.ok(valueBeliefs.some(b => b.topic === 'value:local_vs_global' && b.claim === 'global'));
+  });
+
+  test('produces OCEAN preference proxies from valuesFingerprint', () => {
+    const oceanPrefs = seed.preferences.filter(p => p.type.startsWith('ocean_'));
+    assert.equal(oceanPrefs.length, 2);
+    assert.ok(oceanPrefs.some(p => p.type === 'ocean_conscientiousness'));
+    assert.ok(oceanPrefs.some(p => p.type === 'ocean_openness'));
+  });
+
+  test('produces passion interest entries', () => {
+    const passionInterests = seed.interests.filter(i => i.topic.startsWith('passion:'));
+    assert.equal(passionInterests.length, 2);
+    assert.ok(passionInterests.some(i => i.topic === 'passion:technology'));
+    assert.ok(passionInterests.some(i => i.topic === 'passion:travel'));
+    for (const pi of passionInterests) assert.ok(pi.amount >= 0.7);
+  });
+
+  test('produces passion_category preferences', () => {
+    const passionPrefs = seed.preferences.filter(p => p.type === 'passion_category');
+    assert.equal(passionPrefs.length, 2);
+    assert.ok(passionPrefs.some(p => p.description === 'technology'));
+    assert.ok(passionPrefs.some(p => p.description === 'travel'));
+  });
+
+  test('produces age_bracket identity when ageBracket present', () => {
+    const withAge = answersToKgSeed({ ...PERSONA_ANSWERS, ageBracket: '40s' });
+    const id = withAge.identities.find(i => i.role === 'age_bracket');
+    assert.ok(id, 'age_bracket identity missing');
+    assert.equal(id.context, '40s');
+    assert.ok(id.salience >= 0.7);
+  });
+
+  test('no age_bracket identity when ageBracket absent', () => {
+    const withoutAge = answersToKgSeed(PERSONA_ANSWERS);
+    assert.ok(!withoutAge.identities.find(i => i.role === 'age_bracket'));
+  });
+
+  test('produces jtbd:current belief when freeform present', () => {
+    const withFreeform = answersToKgSeed({ ...PERSONA_ANSWERS, freeform: 'grow my startup' });
+    const belief = withFreeform.beliefs.find(b => b.topic === 'jtbd:current');
+    assert.ok(belief, 'jtbd:current belief missing');
+    assert.equal(belief.claim, 'grow my startup');
+    assert.ok(belief.strength >= 0.7);
+  });
+
+  test('no jtbd:current belief when freeform absent', () => {
+    const { freeform: _, ...noFreeform } = PERSONA_ANSWERS;
+    const s = answersToKgSeed(noFreeform);
+    assert.ok(!s.beliefs.find(b => b.topic === 'jtbd:current'));
+  });
+
+  test('gap count is 4 when professional and financialMindset both present', () => {
+    assert.equal(seed.gaps.length, 4);
+  });
+});
+
 describe('STEPS array — new persona steps', () => {
   test('has 13 steps total', () => {
     assert.equal(STEPS.length, 13);

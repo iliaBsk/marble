@@ -29,6 +29,11 @@ export function answersToKgSeed(answers) {
     salience: 0.85,
   });
 
+  // ── Age bracket (optional) ──
+  if (answers.ageBracket) {
+    seed.identities.push({ role: 'age_bracket', context: answers.ageBracket, salience: 0.8 });
+  }
+
   // ── Kids ──
   seed.identities.push({
     role: 'parental_status',
@@ -93,19 +98,58 @@ export function answersToKgSeed(answers) {
     seed.preferences.push({ type: 'travel_style', description: `winter:${type}`, strength: 0.7 });
   }
 
+  // ── JTBD intent (freeform text) ──
+  if (answers.freeform && answers.freeform.trim()) {
+    seed.beliefs.push({ topic: 'jtbd:current', claim: answers.freeform.trim(), strength: 0.75 });
+  }
+
+  // ── Professional role ──
+  if (answers.professional) {
+    seed.identities.push({ role: 'professional_role', context: answers.professional, salience: 0.9 });
+  }
+
+  // ── Financial mindset ──
+  if (answers.financialMindset) {
+    seed.identities.push({ role: 'wealth_mindset', context: answers.financialMindset, salience: 0.75 });
+  }
+
+  // ── Values fingerprint ──
+  if (answers.valuesFingerprint) {
+    const vf = answers.valuesFingerprint;
+    seed.beliefs.push({ topic: 'value:speed_vs_depth',           claim: vf.speedVsDepth,            strength: 0.7 });
+    seed.beliefs.push({ topic: 'value:stability_vs_opportunity', claim: vf.stabilityVsOpportunity,  strength: 0.7 });
+    seed.beliefs.push({ topic: 'value:local_vs_global',          claim: vf.localVsGlobal,            strength: 0.7 });
+    seed.preferences.push({ type: 'ocean_conscientiousness', description: vf.speedVsDepth,            strength: 0.5 });
+    seed.preferences.push({ type: 'ocean_openness',          description: vf.stabilityVsOpportunity,  strength: 0.5 });
+  }
+
+  // ── Passions ──
+  if (answers.passions && answers.passions.length > 0) {
+    for (const passion of answers.passions) {
+      seed.interests.push({ topic: `passion:${slug(passion)}`, amount: 0.8 });
+      seed.preferences.push({ type: 'passion_category', description: passion, strength: 0.8 });
+    }
+  }
+
   // ── Knowledge gaps for clone seeding ──
-  // These become gap: beliefs that kg.seedClones() picks up
+  // Gaps are omitted when the corresponding field was answered.
+  const filledGaps = new Set();
+  if (answers.professional)     filledGaps.add('gap:profession');
+  if (answers.financialMindset) filledGaps.add('gap:income_bracket');
+
   const gapQuestions = [
-    { topic: 'gap:profession', claim: 'What is the user\'s profession or industry?' },
-    { topic: 'gap:income_bracket', claim: 'What is the user\'s approximate income bracket?' },
-    { topic: 'gap:fitness_habits', claim: 'What are the user\'s fitness and health habits?' },
-    { topic: 'gap:media_depth', claim: 'Does the user prefer deep/niche or broad/mainstream media?' },
+    { topic: 'gap:profession',    claim: "What is the user's profession or industry?" },
+    { topic: 'gap:income_bracket',claim: "What is the user's approximate income bracket?" },
+    { topic: 'gap:fitness_habits',claim: "What are the user's fitness and health habits?" },
+    { topic: 'gap:media_depth',   claim: 'Does the user prefer deep/niche or broad/mainstream media?' },
     { topic: 'gap:tech_affinity', claim: 'How tech-savvy is the user?' },
-    { topic: 'gap:social_values', claim: 'What are the user\'s social and political values?' },
+    { topic: 'gap:social_values', claim: "What are the user's social and political values?" },
   ];
 
   for (const gap of gapQuestions) {
-    seed.gaps.push({ ...gap, strength: 0.2 });
+    if (!filledGaps.has(gap.topic)) {
+      seed.gaps.push({ ...gap, strength: 0.2 });
+    }
   }
 
   return seed;
