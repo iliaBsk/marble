@@ -2,10 +2,15 @@
  * Declarative wizard step definitions.
  * Consumed by both the API (for validation context) and the browser (for rendering).
  *
- * @typedef {'toggle'|'chips'|'city-picker'|'chip-groups'} StepKind
+ * @typedef {'toggle'|'chips'|'city-picker'|'chip-groups'|'freeform'|'pairs'} StepKind
  * @typedef {Object} StepOption
  * @property {string} value
  * @property {string} label
+ *
+ * @typedef {Object} PairDef
+ * @property {string} id
+ * @property {string} labelA
+ * @property {string} labelB
  *
  * @typedef {Object} WizardStep
  * @property {string} id
@@ -14,8 +19,13 @@
  * @property {StepKind} kind
  * @property {StepOption[]} [options]
  * @property {boolean} [multi]
- * @property {string} [dependsOn] - step id whose answer is needed first
- * @property {Object[]} [groups]  - for chip-groups kind
+ * @property {number} [max]
+ * @property {number} [maxLength]
+ * @property {boolean} [nlp]
+ * @property {string} [dependsOn]
+ * @property {Object[]} [groups]
+ * @property {PairDef[]} [pairs]
+ * @property {{ kind: string, optional: boolean, max: number, options: StepOption[] }} [ageBracket]
  */
 
 import {
@@ -27,6 +37,10 @@ import {
   TRAVEL_REGION_OPTIONS,
   TRAVEL_SUMMER_OPTIONS,
   TRAVEL_WINTER_OPTIONS,
+  AGE_BRACKET_OPTIONS,
+  PROFESSIONAL_OPTIONS,
+  FINANCIAL_MINDSET_OPTIONS,
+  PASSION_OPTIONS,
 } from './schema.js';
 
 /** @param {string[]} values @param {(v:string)=>string} [labelFn] @returns {StepOption[]} */
@@ -42,7 +56,7 @@ function toLabel(v) {
 export const STEPS = [
   {
     id: 'maritalStatus',
-    title: 'What\'s your relationship status?',
+    title: "What's your relationship status?",
     kind: 'toggle',
     options: opts(MARITAL_STATUS_OPTIONS, v => ({
       single: 'Single',
@@ -51,6 +65,12 @@ export const STEPS = [
       divorced: 'Divorced / Separated',
       prefer_not_say: 'Prefer not to say',
     }[v])),
+    ageBracket: {
+      kind: 'chips',
+      optional: true,
+      max: 1,
+      options: opts(AGE_BRACKET_OPTIONS),
+    },
   },
   {
     id: 'kids',
@@ -91,7 +111,7 @@ export const STEPS = [
   {
     id: 'location',
     title: 'Where are you based?',
-    subtitle: 'We\'ll tailor local recommendations to your city.',
+    subtitle: "We'll tailor local recommendations to your city.",
     kind: 'city-picker',
   },
   {
@@ -130,9 +150,62 @@ export const STEPS = [
   },
   {
     id: 'freeform',
-    title: 'Anything else we should know?',
-    subtitle: 'Optional — max 280 characters.',
+    title: "What's the #1 thing you want to improve right now?",
+    subtitle: "Optional — tell us what you're trying to solve. (120 chars)",
     kind: 'freeform',
+    maxLength: 120,
+    nlp: true,
+  },
+  {
+    id: 'professional',
+    title: 'What best describes your main role?',
+    kind: 'toggle',
+    options: opts(PROFESSIONAL_OPTIONS, v => ({
+      founder: 'Founder / Co-founder',
+      executive: 'Executive / Senior Manager',
+      investor: 'Investor / Fund Manager',
+      professional: 'Professional / Specialist',
+      other: 'Other',
+    }[v])),
+  },
+  {
+    id: 'financialMindset',
+    title: 'Which feels most relevant to you right now?',
+    kind: 'toggle',
+    options: opts(FINANCIAL_MINDSET_OPTIONS, v => ({
+      grow_income: 'Growing my income or business',
+      protect_assets: 'Protecting and investing what I have',
+      manage_costs: 'Managing costs and getting more value',
+      build_something: 'Building something new from scratch',
+    }[v])),
+  },
+  {
+    id: 'valuesFingerprint',
+    title: 'Choose one from each pair — no right answers',
+    kind: 'pairs',
+    pairs: [
+      { id: 'speedVsDepth',           labelA: 'Speed',     labelB: 'Depth'       },
+      { id: 'stabilityVsOpportunity', labelA: 'Stability', labelB: 'Opportunity' },
+      { id: 'localVsGlobal',          labelA: 'Local',     labelB: 'Global'      },
+    ],
+  },
+  {
+    id: 'passions',
+    title: 'Outside of work, what do you care most about?',
+    subtitle: 'Pick up to 2.',
+    kind: 'chips',
+    multi: true,
+    max: 2,
+    options: opts(PASSION_OPTIONS, v => ({
+      'health-fitness': 'Health & Fitness',
+      family:           'Family',
+      travel:           'Travel',
+      investing:        'Investing',
+      sports:           'Sports',
+      technology:       'Technology',
+      'food-lifestyle': 'Food & Lifestyle',
+      'arts-culture':   'Arts & Culture',
+    }[v])),
   },
 ];
 

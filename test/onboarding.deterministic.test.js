@@ -13,6 +13,7 @@ import {
 import { answersToKgSeed } from '../core/onboarding/to-kg.js';
 import { applyOnboardingToKg } from '../core/onboarding/apply-to-kg.js';
 import { getShopsForCity, getKnownCities } from '../core/onboarding/shops-registry.js';
+import { STEPS, getStep } from '../core/onboarding/steps.js';
 
 // ── Fixtures ─────────────────────────────────────────────────
 
@@ -401,5 +402,60 @@ describe('validateOnboardingAnswers — new persona fields', () => {
   test('exports AGE_BRACKET_OPTIONS with 5 entries', () => {
     assert.equal(AGE_BRACKET_OPTIONS.length, 5);
     assert.ok(AGE_BRACKET_OPTIONS.includes('60s+'));
+  });
+});
+
+describe('STEPS array — new persona steps', () => {
+  test('has 13 steps total', () => {
+    assert.equal(STEPS.length, 13);
+  });
+
+  test('includes professional step with kind toggle', () => {
+    const step = getStep('professional');
+    assert.ok(step, 'professional step missing');
+    assert.equal(step.kind, 'toggle');
+    assert.ok(step.options.some(o => o.value === 'founder'));
+    assert.ok(step.options.some(o => o.value === 'other'));
+  });
+
+  test('includes financialMindset step with 4 options', () => {
+    const step = getStep('financialMindset');
+    assert.ok(step, 'financialMindset step missing');
+    assert.equal(step.kind, 'toggle');
+    assert.equal(step.options.length, 4);
+  });
+
+  test('includes valuesFingerprint step with kind pairs and 3 pairs', () => {
+    const step = getStep('valuesFingerprint');
+    assert.ok(step, 'valuesFingerprint step missing');
+    assert.equal(step.kind, 'pairs');
+    assert.equal(step.pairs.length, 3);
+    assert.ok(step.pairs.some(p => p.id === 'speedVsDepth'));
+    assert.ok(step.pairs.some(p => p.id === 'stabilityVsOpportunity'));
+    assert.ok(step.pairs.some(p => p.id === 'localVsGlobal'));
+  });
+
+  test('includes passions step with 8 options and max 2', () => {
+    const step = getStep('passions');
+    assert.ok(step, 'passions step missing');
+    assert.equal(step.kind, 'chips');
+    assert.equal(step.multi, true);
+    assert.equal(step.max, 2);
+    assert.equal(step.options.length, 8);
+  });
+
+  test('maritalStatus step has ageBracket sub-field', () => {
+    const step = getStep('maritalStatus');
+    assert.ok(step.ageBracket, 'ageBracket sub-field missing');
+    assert.equal(step.ageBracket.kind, 'chips');
+    assert.equal(step.ageBracket.optional, true);
+    assert.equal(step.ageBracket.max, 1);
+  });
+
+  test('freeform step has updated prompt and maxLength 120', () => {
+    const step = getStep('freeform');
+    assert.ok(step.title.includes('improve') || step.title.includes('solve'), 'freeform title not updated');
+    assert.equal(step.maxLength, 120);
+    assert.equal(step.nlp, true);
   });
 });
