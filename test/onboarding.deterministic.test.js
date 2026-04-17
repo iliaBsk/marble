@@ -5,6 +5,10 @@ import {
   validateOnboardingAnswers,
   MARITAL_STATUS_OPTIONS,
   KIDS_OPTIONS,
+  PROFESSIONAL_OPTIONS,
+  FINANCIAL_MINDSET_OPTIONS,
+  PASSION_OPTIONS,
+  AGE_BRACKET_OPTIONS,
 } from '../core/onboarding/schema.js';
 import { answersToKgSeed } from '../core/onboarding/to-kg.js';
 import { applyOnboardingToKg } from '../core/onboarding/apply-to-kg.js';
@@ -120,8 +124,8 @@ describe('validateOnboardingAnswers', () => {
     assert.ok(result.errors.some(e => e.includes('movieGenres')));
   });
 
-  test('rejects freeform over 280 chars', () => {
-    const result = validateOnboardingAnswers({ ...VALID_ANSWERS, freeform: 'x'.repeat(281) });
+  test('rejects freeform over 120 chars', () => {
+    const result = validateOnboardingAnswers({ ...VALID_ANSWERS, freeform: 'x'.repeat(121) });
     assert.equal(result.ok, false);
     assert.ok(result.errors.some(e => e.includes('freeform')));
   });
@@ -256,6 +260,20 @@ describe('applyOnboardingToKg', () => {
   });
 });
 
+// ── New persona fields validation ─────────────────────────────
+
+const PERSONA_ANSWERS = {
+  ...VALID_ANSWERS,
+  professional: 'founder',
+  financialMindset: 'grow_income',
+  valuesFingerprint: {
+    speedVsDepth: 'speed',
+    stabilityVsOpportunity: 'opportunity',
+    localVsGlobal: 'global',
+  },
+  passions: ['technology', 'travel'],
+};
+
 // ── shops-registry ────────────────────────────────────────────
 
 describe('getShopsForCity', () => {
@@ -284,5 +302,94 @@ describe('getShopsForCity', () => {
   test('getKnownCities returns at least 8 cities', () => {
     const cities = getKnownCities();
     assert.ok(cities.length >= 8);
+  });
+});
+
+describe('validateOnboardingAnswers — new persona fields', () => {
+  test('accepts answers with all new fields present', () => {
+    const result = validateOnboardingAnswers(PERSONA_ANSWERS);
+    assert.equal(result.ok, true);
+  });
+
+  test('accepts answers where new fields are absent (backward compat)', () => {
+    const result = validateOnboardingAnswers(VALID_ANSWERS);
+    assert.equal(result.ok, true);
+  });
+
+  test('rejects invalid professional value', () => {
+    const result = validateOnboardingAnswers({ ...PERSONA_ANSWERS, professional: 'wizard' });
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some(e => e.includes('professional')));
+  });
+
+  test('rejects invalid financialMindset value', () => {
+    const result = validateOnboardingAnswers({ ...PERSONA_ANSWERS, financialMindset: 'hoard_gold' });
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some(e => e.includes('financialMindset')));
+  });
+
+  test('rejects valuesFingerprint missing a key', () => {
+    const result = validateOnboardingAnswers({
+      ...PERSONA_ANSWERS,
+      valuesFingerprint: { speedVsDepth: 'speed', stabilityVsOpportunity: 'stability' },
+    });
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some(e => e.includes('valuesFingerprint')));
+  });
+
+  test('rejects valuesFingerprint with invalid value', () => {
+    const result = validateOnboardingAnswers({
+      ...PERSONA_ANSWERS,
+      valuesFingerprint: { speedVsDepth: 'turbo', stabilityVsOpportunity: 'stability', localVsGlobal: 'local' },
+    });
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some(e => e.includes('valuesFingerprint')));
+  });
+
+  test('rejects passions with more than 2 items', () => {
+    const result = validateOnboardingAnswers({
+      ...PERSONA_ANSWERS,
+      passions: ['technology', 'travel', 'sports'],
+    });
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some(e => e.includes('passions')));
+  });
+
+  test('rejects passions with invalid value', () => {
+    const result = validateOnboardingAnswers({
+      ...PERSONA_ANSWERS,
+      passions: ['rugby'],
+    });
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some(e => e.includes('passions')));
+  });
+
+  test('rejects empty passions array', () => {
+    const result = validateOnboardingAnswers({ ...PERSONA_ANSWERS, passions: [] });
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some(e => e.includes('passions')));
+  });
+
+  test('rejects ageBracket with invalid value', () => {
+    const result = validateOnboardingAnswers({ ...PERSONA_ANSWERS, ageBracket: '100s' });
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some(e => e.includes('ageBracket')));
+  });
+
+  test('accepts valid ageBracket', () => {
+    const result = validateOnboardingAnswers({ ...PERSONA_ANSWERS, ageBracket: '40s' });
+    assert.equal(result.ok, true);
+  });
+
+  test('exports PROFESSIONAL_OPTIONS with 5 entries', () => {
+    assert.equal(PROFESSIONAL_OPTIONS.length, 5);
+    assert.ok(PROFESSIONAL_OPTIONS.includes('founder'));
+    assert.ok(PROFESSIONAL_OPTIONS.includes('other'));
+  });
+
+  test('exports PASSION_OPTIONS with 8 entries', () => {
+    assert.equal(PASSION_OPTIONS.length, 8);
+    assert.ok(PASSION_OPTIONS.includes('technology'));
+    assert.ok(PASSION_OPTIONS.includes('arts-culture'));
   });
 });
