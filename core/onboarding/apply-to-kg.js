@@ -138,7 +138,8 @@ export async function applyPersonaEnrichment(kg, answers, opts = {}) {
         role: answers.professional,
         ageBracket: answers.ageBracket,
       });
-      if (result) {
+      const ALLOWED_JTBD = new Set(['grow_income', 'protect_assets', 'manage_costs', 'build_something', 'personal_development']);
+      if (result && ALLOWED_JTBD.has(result.jtbd_category)) {
         kg.addBelief('jtbd:category', result.jtbd_category, 0.8);
         kg.addBelief('jtbd:urgency',  String(result.urgency_score), 0.7);
         for (const cluster of result.topic_clusters) {

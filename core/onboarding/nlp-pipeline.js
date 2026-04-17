@@ -17,7 +17,7 @@ const sanitizeCtx = (v) => String(v || 'unknown').replace(/[\n\r"]/g, ' ').slice
 const PROMPT_TEMPLATE = (text, context) =>
   `Analyze this user statement and return JSON only.
 
-User statement: "${text.replace(/"/g, '\\"').slice(0, 120)}"
+User statement: "${text.replace(/[\n\r"]/g, ' ').slice(0, 120)}"
 User context: role=${sanitizeCtx(context.role)}, ageBracket=${sanitizeCtx(context.ageBracket)}
 
 Return exactly this JSON structure with no other text:

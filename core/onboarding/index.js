@@ -60,8 +60,10 @@ export async function onboardUser(kg, answers, opts = {}) {
     }
   }
 
-  // Phase 3: Persona enrichment — fire-and-forget NLP + Wikidata (never awaited)
-  applyPersonaEnrichment(kg, validation.value).catch(() => {});
+  // Phase 3: Persona enrichment — fire-and-forget. Schedule a KG save after it completes
+  // so NLP beliefs and Wikidata QIDs survive to disk (main save in Marble.onboard() captures
+  // the deterministic seed; this deferred save captures enrichment).
+  applyPersonaEnrichment(kg, validation.value).then(() => kg.save()).catch(() => {});
 
   onProgress?.('done');
 
