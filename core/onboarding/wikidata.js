@@ -51,18 +51,21 @@ export async function enrichWithWikidata(kg, passions) {
         const url = `${SPARQL_ENDPOINT}?query=${encodeURIComponent(sparql)}&format=json`;
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 5000);
-        const resp = await fetch(url, {
-          signal: controller.signal,
-          headers: { Accept: 'application/json', 'User-Agent': 'MarblePersona/1.0' },
-        });
-        clearTimeout(timer);
-        if (!resp.ok) continue;
-        const data = await resp.json();
-        for (const binding of (data.results?.bindings || [])) {
-          const subQid = binding.sub?.value?.split('/').pop();
-          if (subQid && /^Q\d+$/.test(subQid)) {
-            kg.boostInterest(`wikidata:${subQid}`, 0.5);
+        try {
+          const resp = await fetch(url, {
+            signal: controller.signal,
+            headers: { Accept: 'application/json', 'User-Agent': 'MarblePersona/1.0' },
+          });
+          if (!resp.ok) continue;
+          const data = await resp.json();
+          for (const binding of (data.results?.bindings || [])) {
+            const subQid = binding.sub?.value?.split('/').pop();
+            if (subQid && /^Q\d+$/.test(subQid)) {
+              kg.boostInterest(`wikidata:${subQid}`, 0.5);
+            }
           }
+        } finally {
+          clearTimeout(timer);
         }
       } catch {
         // silently skip on timeout or network error
