@@ -4,7 +4,7 @@
 
 import { validateOnboardingAnswers } from './schema.js';
 import { answersToKgSeed } from './to-kg.js';
-import { applyOnboardingToKg, applyEnrichmentToKg } from './apply-to-kg.js';
+import { applyOnboardingToKg, applyEnrichmentToKg, applyPersonaEnrichment } from './apply-to-kg.js';
 import { runDeepResearch } from './deep-research.js';
 
 /**
@@ -59,6 +59,9 @@ export async function onboardUser(kg, answers, opts = {}) {
       onProgress?.('research_failed', { error: enrichmentError });
     }
   }
+
+  // Phase 3: Persona enrichment — fire-and-forget NLP + Wikidata (never awaited)
+  applyPersonaEnrichment(kg, validation.value).catch(() => {});
 
   onProgress?.('done');
 
