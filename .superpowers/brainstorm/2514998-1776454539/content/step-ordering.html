@@ -1,0 +1,56 @@
+<h2>Where do the new steps go?</h2>
+<p class="subtitle">The spec adds 5 new steps (Q1–Q5). Three ways to slot them into the existing 9-step wizard.</p>
+
+<div class="options">
+
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>Professional-first</h3>
+      <p>New steps up front, then existing lifestyle steps. Matches the spec's intended order.</p>
+      <div style="margin-top:12px;font-size:0.82rem;line-height:1.8;color:#555">
+        <span style="background:#6366f1;color:#fff;border-radius:3px;padding:1px 6px;font-size:0.75rem">NEW</span> Q1 Professional role<br>
+        <span style="background:#6366f1;color:#fff;border-radius:3px;padding:1px 6px;font-size:0.75rem">NEW</span> Q2 Current priority (JTBD)<br>
+        <span style="background:#6366f1;color:#fff;border-radius:3px;padding:1px 6px;font-size:0.75rem">NEW</span> Q3 Financial mindset<br>
+        <span style="background:#6366f1;color:#fff;border-radius:3px;padding:1px 6px;font-size:0.75rem">NEW</span> Q4 Values fingerprint<br>
+        <span style="background:#6366f1;color:#fff;border-radius:3px;padding:1px 6px;font-size:0.75rem">NEW</span> Q5 Passions<br>
+        <span style="color:#aaa">── existing: marital status, kids, movies, food, allergies, location, shops, travel, freeform</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Lifestyle-first (additive)</h3>
+      <p>Keep existing steps in place, append new ones after. Minimal disruption, safest for tested flows.</p>
+      <div style="margin-top:12px;font-size:0.82rem;line-height:1.8;color:#555">
+        <span style="color:#aaa">── existing: marital status, kids, movies, food, allergies, location, shops, travel, freeform</span><br>
+        <span style="background:#6366f1;color:#fff;border-radius:3px;padding:1px 6px;font-size:0.75rem">NEW</span> Q1 Professional role<br>
+        <span style="background:#6366f1;color:#fff;border-radius:3px;padding:1px 6px;font-size:0.75rem">NEW</span> Q2 Current priority (JTBD)<br>
+        <span style="background:#6366f1;color:#fff;border-radius:3px;padding:1px 6px;font-size:0.75rem">NEW</span> Q3 Financial mindset<br>
+        <span style="background:#6366f1;color:#fff;border-radius:3px;padding:1px 6px;font-size:0.75rem">NEW</span> Q4 Values fingerprint<br>
+        <span style="background:#6366f1;color:#fff;border-radius:3px;padding:1px 6px;font-size:0.75rem">NEW</span> Q5 Passions
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>Grouped by theme</h3>
+      <p>Re-order into logical groups: identity → professional → values → lifestyle. Feels most coherent but requires reordering existing steps.</p>
+      <div style="margin-top:12px;font-size:0.82rem;line-height:1.8;color:#555">
+        <strong style="color:#333">Identity:</strong> marital status, kids, location<br>
+        <span style="background:#6366f1;color:#fff;border-radius:3px;padding:1px 6px;font-size:0.75rem">NEW</span> <strong style="color:#333">Professional:</strong> Q1 role, Q2 priority, Q3 financial mindset<br>
+        <span style="background:#6366f1;color:#fff;border-radius:3px;padding:1px 6px;font-size:0.75rem">NEW</span> <strong style="color:#333">Values:</strong> Q4 fingerprint, Q5 passions<br>
+        <strong style="color:#333">Lifestyle:</strong> movies, food, allergies, shops, travel, freeform
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div class="section" style="margin-top:24px;padding:14px;background:#fffbe6;border-radius:8px;font-size:0.85rem;color:#666">
+  <strong>Note on total step count:</strong> Adding 5 new steps brings the wizard to 14 steps. Option C also removes the standalone <em>freeform</em> step (Q2 replaces it as the intent capture). That lands at 13 steps. Any of these can be chunked into progress sections (e.g. "About you · Work · Interests") to reduce perceived length.
+</div>

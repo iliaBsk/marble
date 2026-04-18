@@ -1,0 +1,86 @@
+<h2>Q4 — Values Fingerprint widget</h2>
+<p class="subtitle">3 binary trade-off pairs in one step. Which treatment feels right?</p>
+
+<div class="options">
+
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>New <code>pairs</code> kind</h3>
+      <p>A dedicated step kind: 3 rows, each row has 2 mutually exclusive buttons. One selection required per row.</p>
+      <div class="mockup" style="margin-top:10px">
+        <div class="mockup-header">Choose one from each pair</div>
+        <div class="mockup-body" style="display:flex;flex-direction:column;gap:10px;padding:12px">
+          <div style="display:flex;gap:8px;align-items:center">
+            <button style="flex:1;padding:8px;border:2px solid #6366f1;background:#ede9fe;border-radius:6px;font-size:0.85rem;cursor:pointer">⚡ Speed</button>
+            <span style="color:#aaa;font-size:0.8rem">vs</span>
+            <button style="flex:1;padding:8px;border:2px solid #e5e7eb;background:#fff;border-radius:6px;font-size:0.85rem;cursor:pointer">🔍 Depth</button>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <button style="flex:1;padding:8px;border:2px solid #e5e7eb;background:#fff;border-radius:6px;font-size:0.85rem;cursor:pointer">🏔 Stability</button>
+            <span style="color:#aaa;font-size:0.8rem">vs</span>
+            <button style="flex:1;padding:8px;border:2px solid #6366f1;background:#ede9fe;border-radius:6px;font-size:0.85rem;cursor:pointer">🚀 Opportunity</button>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <button style="flex:1;padding:8px;border:2px solid #e5e7eb;background:#fff;border-radius:6px;font-size:0.85rem;cursor:pointer">📍 Local</button>
+            <span style="color:#aaa;font-size:0.8rem">vs</span>
+            <button style="flex:1;padding:8px;border:2px solid #e5e7eb;background:#fff;border-radius:6px;font-size:0.85rem;cursor:pointer">🌍 Global</button>
+          </div>
+        </div>
+      </div>
+      <div class="pros-cons" style="margin-top:10px">
+        <div class="pros"><h4>Pros</h4><ul><li>Cleanest semantics</li><li>All 3 pairs on one screen</li></ul></div>
+        <div class="cons"><h4>Cons</h4><ul><li>New kind to build in wizard UI</li></ul></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Reuse <code>chip-groups</code></h3>
+      <p>Each pair is a group with exactly 2 chips, min/max selection = 1. No new kind, but groups were designed for multi-select.</p>
+      <div class="mockup" style="margin-top:10px">
+        <div class="mockup-header">Which feels more like you?</div>
+        <div class="mockup-body" style="padding:12px;font-size:0.82rem;color:#555">
+          <div style="margin-bottom:8px"><strong>Pair 1</strong><br>
+            <span style="display:inline-block;margin:4px 4px 0 0;padding:5px 12px;background:#ede9fe;border:2px solid #6366f1;border-radius:20px">⚡ Speed</span>
+            <span style="display:inline-block;margin:4px 4px 0 0;padding:5px 12px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:20px">🔍 Depth</span>
+          </div>
+          <div style="margin-bottom:8px"><strong>Pair 2</strong><br>
+            <span style="display:inline-block;margin:4px 4px 0 0;padding:5px 12px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:20px">🏔 Stability</span>
+            <span style="display:inline-block;margin:4px 4px 0 0;padding:5px 12px;background:#ede9fe;border:2px solid #6366f1;border-radius:20px">🚀 Opportunity</span>
+          </div>
+          <div><strong>Pair 3</strong><br>
+            <span style="display:inline-block;margin:4px 4px 0 0;padding:5px 12px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:20px">📍 Local</span>
+            <span style="display:inline-block;margin:4px 4px 0 0;padding:5px 12px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:20px">🌍 Global</span>
+          </div>
+        </div>
+      </div>
+      <div class="pros-cons" style="margin-top:10px">
+        <div class="pros"><h4>Pros</h4><ul><li>No new wizard kind</li><li>Works with existing UI components</li></ul></div>
+        <div class="cons"><h4>Cons</h4><ul><li>Semantic mismatch — chip-groups is multi-select by design</li><li>Needs min/max=1 enforcement per group</li></ul></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>3 separate <code>toggle</code> steps</h3>
+      <p>Each binary pair becomes its own toggle step (2 options). No new kind, familiar UI, but adds 3 steps instead of 1.</p>
+      <div class="mockup" style="margin-top:10px">
+        <div class="mockup-header">Step 11 of 16 — What drives you more?</div>
+        <div class="mockup-body" style="display:flex;gap:10px;padding:12px">
+          <button style="flex:1;padding:14px;border:2px solid #6366f1;background:#ede9fe;border-radius:8px;font-size:0.9rem">⚡ Speed</button>
+          <button style="flex:1;padding:14px;border:1px solid #e5e7eb;background:#fff;border-radius:8px;font-size:0.9rem">🔍 Depth</button>
+        </div>
+      </div>
+      <div class="pros-cons" style="margin-top:10px">
+        <div class="pros"><h4>Pros</h4><ul><li>Zero new code</li><li>Each choice gets full focus</li></ul></div>
+        <div class="cons"><h4>Cons</h4><ul><li>15 total steps (feels long)</li><li>3 screens for what the spec intends as 1</li></ul></div>
+      </div>
+    </div>
+  </div>
+
+</div>
