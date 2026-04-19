@@ -111,7 +111,7 @@ async function renderStep(index) {
       }
     }
 
-    const chips = createChipGroup({ options, multi: step.multi !== false, name: step.id });
+    const chips = createChipGroup({ options, multi: step.multi !== false, max: step.max ?? null, name: step.id });
     if (answers[step.id]) chips.setValue(answers[step.id]);
     control = chips;
     card.appendChild(chips.element);

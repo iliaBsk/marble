@@ -1,10 +1,10 @@
 /**
  * Multi- or single-select chip group component.
  *
- * @param {{ options: {value:string,label:string}[], multi?: boolean, name: string }} config
+ * @param {{ options: {value:string,label:string}[], multi?: boolean, max?: number, name: string }} config
  * @returns {{ element: HTMLElement, getValue: ()=>string|string[], setValue: (v:string|string[])=>void, on: (ev:string, cb:Function)=>void }}
  */
-export function createChipGroup({ options, multi = false, name }) {
+export function createChipGroup({ options, multi = false, max = null, name }) {
   const container = document.createElement('div');
   container.className = 'chip-group';
   container.setAttribute('role', 'group');
@@ -23,6 +23,10 @@ export function createChipGroup({ options, multi = false, name }) {
     btn.addEventListener('click', () => {
       if (multi) {
         const pressed = btn.getAttribute('aria-pressed') === 'true';
+        if (!pressed && max !== null) {
+          const currentCount = container.querySelectorAll('.chip[aria-pressed="true"]').length;
+          if (currentCount >= max) return;
+        }
         btn.setAttribute('aria-pressed', String(!pressed));
         btn.classList.toggle('selected', !pressed);
       } else {
