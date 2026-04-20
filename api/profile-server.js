@@ -91,7 +91,11 @@ marble.init().then(() => {
   }
 
   // Mount onboarding API after marble is ready so routes share the same instance
-  mountOnboarding(app, { marble });
+  mountOnboarding(app, { marble, openAiOptions: {
+    apiKey: process.env.OPENAI_API_KEY ?? '',
+    baseUrl: process.env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1',
+    model: process.env.LLM_MODEL ?? process.env.OPENAI_MODEL ?? 'gpt-4o-mini',
+  } });
 
   // Mount enrichment API
   mountEnrichment(app, {
@@ -244,6 +248,30 @@ app.post('/user-profile/profile/decisions', async (req, res) => {
   }
 });
 
+// ── Select / Score Items ──────────────────────────────────────────────────────
+
+app.post('/user-profile/select', async (req, res) => {
+  if (!ready) {
+    res.status(503).json({ ok: false, errors: ['not ready'] });
+    return;
+  }
+  try {
+    const { items = [], context = {} } = req.body ?? {};
+    const limit = context.limit ?? items.length;
+    const selected = await marble.select(items, { ...context, arcReorder: false });
+    const ranked = selected
+      .slice(0, limit)
+      .map((entry, idx) => {
+        const id = (entry.story ?? entry).id ?? entry.id;
+        return { id, score: entry.score ?? 0.5, rank: entry.rank ?? (idx + 1) };
+      });
+    res.json({ ok: true, data: { selected: ranked } });
+  } catch (err) {
+    console.error('[profile-server] select error:', err.message);
+    res.status(500).json({ ok: false, errors: [err.message] });
+  }
+});
+
 // ── Graph Summary ─────────────────────────────────────────────────────────────
 
 app.get('/user-profile/graph/summary', (_req, res) => {
@@ -263,6 +291,7 @@ app.get('/user-profile/graph/summary', (_req, res) => {
       memory: kg.getMemoryNodesSummary(),
       context: kg.user.context,
       last_insight: kg.getLastInsightResult(),
+      wikidataLabels: kg.user.wikidataLabels ?? {},
     });
   } catch (err) {
     console.error('[profile-server] summary error:', err.message);
@@ -281,9 +310,40 @@ app.get('/user-profile/graph/ui', (_req, res) => {
   try {
     const audienceId = process.env.AUDIENCE_ID ?? 'unknown';
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(buildUiHtml());
+    res.send(buildUiHtml(audienceId, KG_FILE));
   } catch (err) {
     res.status(500).send(`<pre>${err.message}</pre>`);
+  }
+});
+
+app.post('/ui/decide', async (req, res) => {
+  if (!ready) {
+    res.status(503).json({ error: 'not ready' });
+    return;
+  }
+
+  try {
+    const { decision, item_id } = req.body ?? {};
+    if (!decision || !item_id) {
+      res.status(400).json({ error: 'body must include decision and item_id' });
+      return;
+    }
+
+    const safeId = raw => String(raw ?? '').replace(/[^A-Za-z0-9._-]/g, '_');
+    const suggestions = marble.kg.user.suggestions ?? [];
+    const suggestion = suggestions.find(s => safeId(s.id) === item_id);
+    if (!suggestion) {
+      res.status(404).json({ error: 'suggestion not found' });
+      return;
+    }
+
+    suggestion.status = decision === 'approve' ? 'approved' : 'rejected';
+    suggestion.decided_at = new Date().toISOString();
+    await marble.kg.save();
+    res.json({ message: `${decision === 'approve' ? 'Approved' : 'Rejected'}: ${suggestion.label}` });
+  } catch (err) {
+    console.error('[profile-server] ui/decide error:', err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -301,6 +361,13 @@ app.get('/user-profile/graph/nodes', (_req, res) => {
     const nodes = [];
     const edges = [];
 
+    const wikidataLabels = kg.user.wikidataLabels ?? {};
+    const resolveLabel = topic => {
+      if (!topic.startsWith('wikidata:')) return topic;
+      const qid = topic.slice('wikidata:'.length);
+      return wikidataLabels[qid]?.label ?? topic;
+    };
+
     // Central user node
     nodes.push({ id: 'user', label: 'User', group: 'user', title: 'Central node' });
 
@@ -308,11 +375,17 @@ app.get('/user-profile/graph/nodes', (_req, res) => {
     for (const interest of user.interests ?? []) {
       const id = `interest-${interest.topic}`;
       const pct = Math.round((interest.weight ?? 0) * 100);
+      const humanLabel = resolveLabel(interest.topic);
+      const isWikidata = interest.topic.startsWith('wikidata:');
+      const qid = isWikidata ? interest.topic.slice('wikidata:'.length) : null;
+      const description = qid ? (wikidataLabels[qid]?.description ?? '') : '';
       nodes.push({
         id,
-        label: `${interest.topic}\n${pct}%`,
+        label: `${humanLabel}\n${pct}%`,
         group: 'interest',
-        title: `Interest: ${interest.topic}`,
+        title: isWikidata
+          ? `${humanLabel}${description ? ` — ${description}` : ''}\n(${interest.topic})`
+          : `Interest: ${interest.topic}`,
         data: interest,
       });
       edges.push({ from: 'user', to: id, label: 'LIKES' });

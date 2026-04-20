@@ -7,6 +7,7 @@ import express from 'express';
 import { validateOnboardingAnswers } from '../core/onboarding/schema.js';
 import { getShopsForCity, getKnownCities } from '../core/onboarding/shops-registry.js';
 import { STEPS } from '../core/onboarding/steps.js';
+import { runEnrichment } from '../core/enrichment/index.js';
 
 const RATE_WINDOW_MS = 5 * 60 * 1000;
 const RATE_MAX = 10;
@@ -46,7 +47,27 @@ function createRateLimiter(windowMs, max) {
  * @param {import('express').Application} app
  * @param {{ marble: import('../core/index.js').Marble }} param1
  */
-export function mountOnboarding(app, { marble }) {
+async function seedSources(answers) {
+  const vivoFactoryUrl = (process.env.VIVO_FACTORY_URL ?? '').replace(/\/$/, '');
+  const audienceId = process.env.AUDIENCE_ID ?? '';
+  if (!vivoFactoryUrl || !audienceId) return;
+  try {
+    await fetch(`${vivoFactoryUrl}/api/audiences/${audienceId}/sources/seed`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        city: answers.location?.city ?? '',
+        passions: answers.passions ?? [],
+        foodPreferences: answers.foodPreferences ?? [],
+        movieGenres: answers.movieGenres ?? [],
+      }),
+    });
+  } catch (err) {
+    console.error('[onboarding] source seeding error:', err.message);
+  }
+}
+
+export function mountOnboarding(app, { marble, openAiOptions }) {
   const router = express.Router();
   const submitLimiter = createRateLimiter(RATE_WINDOW_MS, RATE_MAX);
 
@@ -86,6 +107,12 @@ export function mountOnboarding(app, { marble }) {
           enrichmentError: result.enrichmentError,
         },
       });
+      if (openAiOptions?.apiKey) {
+        runEnrichment(marble.kg, openAiOptions).catch(err =>
+          console.error('[onboarding] post-onboard enrichment error:', err.message)
+        );
+      }
+      seedSources(validation.value);
     } catch (err) {
       if (err.code === 'VALIDATION_ERROR') {
         return res.status(400).json({ success: false, error: err.errors.join('; ') });
@@ -133,6 +160,12 @@ export function mountOnboarding(app, { marble }) {
       });
 
       stopHeartbeat();
+      if (openAiOptions?.apiKey) {
+        runEnrichment(marble.kg, openAiOptions).catch(err =>
+          console.error('[onboarding] post-onboard enrichment error:', err.message)
+        );
+      }
+      seedSources(validation.value);
     } catch (err) {
       stopHeartbeat();
       if (err.name !== 'AbortError') {
