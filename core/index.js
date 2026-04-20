@@ -18,6 +18,12 @@ import { Swarm } from './swarm.js';
 import { Clone } from './clone.js';
 import { decayPass } from './decay.js';
 
+// Module-level flags so missing-provider warnings fire at most once per
+// process, not once per `new Marble()`. Batch workloads (one instance per
+// user/request/session) would otherwise flood stderr with duplicates.
+let _warnedNoLLM = false;
+let _warnedNoEmbeddings = false;
+
 export class Marble {
   /**
    * @param {Object} opts
@@ -29,6 +35,7 @@ export class Marble {
    * @param {boolean}  [opts.arcReorder=false] - Apply narrative arc reranking (newsletter/content curation only)
    * @param {number}   [opts.coldStartThreshold=10] - Signals needed before full personalization
    * @param {number}   [opts.cloneBoostWeight=0.3] - How much clone consensus influences scoring
+   * @param {boolean}  [opts.silent=false] - Suppress construction-time warnings about missing providers
    */
   constructor({
     storage = './marble-kg.json',
@@ -39,9 +46,10 @@ export class Marble {
     arcReorder = false,
     coldStartThreshold = 10,
     cloneBoostWeight = 0.3,
+    silent = false,
   } = {}) {
     this.kg = new KnowledgeGraph(storage);
-    this.scorer = new Scorer(this.kg, { coldStartThreshold });
+    this.scorer = new Scorer(this.kg, { coldStartThreshold, embeddings });
     this.arc = new ArcReranker();
     this.count = count;
     this.mode = mode;
@@ -55,13 +63,17 @@ export class Marble {
     this.clonePopulation = null;
     this.feedbackEngine = null;
 
-    if (!llm) {
+    if (!silent && !llm && !_warnedNoLLM) {
+      _warnedNoLLM = true;
       console.warn('[Marble] No LLM provider configured. Only L0+L1 scoring available. '
-        + 'Pass { llm: yourLLMFunction } for full pipeline (L1.5, L2, L3).');
+        + 'Pass { llm: yourLLMFunction } for full pipeline (L1.5, L2, L3). '
+        + 'Pass { silent: true } to suppress this warning.');
     }
-    if (!embeddings && !process.env.OPENAI_API_KEY) {
+    if (!silent && !embeddings && !process.env.OPENAI_API_KEY && !_warnedNoEmbeddings) {
+      _warnedNoEmbeddings = true;
       console.warn('[Marble] No embeddings configured. Scorer will use keyword matching only. '
-        + 'Set OPENAI_API_KEY or pass { embeddings: provider } for semantic scoring.');
+        + 'Set OPENAI_API_KEY or pass { embeddings: provider } for semantic scoring. '
+        + 'Pass { silent: true } to suppress this warning.');
     }
   }
 

@@ -2,12 +2,13 @@
  * Embeddings for Marble
  *
  * Provides semantic embeddings via API providers.
- * Supported providers: openai (default), deepseek
+ * Supported providers: openai (default), deepseek, none
  *
  * Requires OPENAI_API_KEY (or DEEPSEEK_API_KEY for deepseek provider).
+ * Set EMBEDDINGS_PROVIDER=none to explicitly opt into keyword-only scoring.
  * If the provider cannot be initialised (missing key) or an API call fails at
- * runtime, a NullEmbeddings fallback is used — findMostSimilar() returns no
- * match so callers fall through to their keyword/topic-based fallback paths.
+ * runtime, a NullEmbeddings fallback is used (with a one-time prominent
+ * warning) so callers fall through to their keyword/topic-based fallback paths.
  */
 
 /**
@@ -161,6 +162,10 @@ function createEmbeddingsProvider(options = {}) {
     case 'deepseek':
       return new DeepSeekEmbeddings(options);
 
+    case 'none':
+      // Explicit opt-in to keyword-only scoring. No semantic matching.
+      return new NullEmbeddings();
+
     case 'anthropic':
       throw new Error(
         'Anthropic does not offer an embeddings API. ' +
@@ -170,24 +175,44 @@ function createEmbeddingsProvider(options = {}) {
     case 'local':
       throw new Error(
         'Local ONNX embeddings have been removed from Marble. ' +
-        'Set OPENAI_API_KEY and use EMBEDDINGS_PROVIDER=openai (default).'
+        'Set OPENAI_API_KEY and use EMBEDDINGS_PROVIDER=openai (default), ' +
+        'or use EMBEDDINGS_PROVIDER=none for explicit keyword-only scoring.'
       );
 
     default:
       throw new Error(
-        `Unknown EMBEDDINGS_PROVIDER "${provider}". Supported: "openai", "deepseek".`
+        `Unknown EMBEDDINGS_PROVIDER "${provider}". ` +
+        `Supported: "openai", "deepseek", "none".`
       );
   }
 }
 
 // Export singleton instance (respects EMBEDDINGS_PROVIDER env var).
 // If the provider cannot be initialised (e.g. missing API key) we fall back to
-// NullEmbeddings so the module loads cleanly and callers degrade gracefully.
+// NullEmbeddings so the module loads cleanly, but emit a prominent one-time
+// warning so integrators don't silently lose semantic scoring on the happy path.
+// Callers who want to suppress this should either:
+//   (a) set EMBEDDINGS_PROVIDER=none to explicitly opt into keyword-only, or
+//   (b) pass their own provider to `new Marble({ embeddings: ... })`.
 export const embeddings = (() => {
   try {
     return createEmbeddingsProvider();
   } catch (err) {
-    console.warn(`[embeddings] Provider init failed (${err.message}) — using NullEmbeddings. Embedding-based scoring will be skipped.`);
+    const requestedNone = (process.env.EMBEDDINGS_PROVIDER || '').toLowerCase() === 'none';
+    if (!requestedNone) {
+      const banner =
+        '\n' +
+        '┌─ Marble embeddings ─────────────────────────────────────────┐\n' +
+        '│  Provider init failed — falling back to NullEmbeddings.     │\n' +
+        '│  Semantic scoring is DISABLED; scorer uses keyword only.    │\n' +
+        '│  Fix: set OPENAI_API_KEY (or DEEPSEEK_API_KEY) and a valid  │\n' +
+        '│       EMBEDDINGS_PROVIDER, or pass { embeddings: ... } to   │\n' +
+        '│       the Marble constructor. To silence this warning,      │\n' +
+        '│       set EMBEDDINGS_PROVIDER=none explicitly.              │\n' +
+        `│  Reason: ${err.message.slice(0, 50).padEnd(50)} │\n` +
+        '└─────────────────────────────────────────────────────────────┘';
+      console.warn(banner);
+    }
     return new NullEmbeddings();
   }
 })();

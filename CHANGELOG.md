@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Install-time blockers (OOTB integration pass 1)
+
+- **`.env.example` no longer misrepresents the default embeddings provider.**
+  The old default `EMBEDDINGS_PROVIDER=local` claimed "no API key needed"
+  but was falling through to `NullEmbeddings` with a single easy-to-miss warning
+  (local ONNX embeddings were removed). Default is now `openai` with an explicit
+  `OPENAI_API_KEY` requirement, and `EMBEDDINGS_PROVIDER=none` is documented as
+  the explicit keyword-only opt-in.
+- **Louder failure when embeddings fail to initialize.** The module-level
+  singleton now emits a prominent one-time boxed warning that names the problem
+  and the fix. Integrators who request `EMBEDDINGS_PROVIDER=none` or pass their
+  own `{ embeddings: ... }` to the constructor see no warning.
+- **`KnowledgeGraph#seedClones` and `#breedStrongClones` no longer crash on
+  malformed LLM output.** Both sites used `text.match(/.../)[0]` which threw
+  `Cannot read properties of null` on empty/prose/truncated completions.
+  Replaced with a tolerant `_extractJSON(text, shape)` helper; failures now log
+  a clear warning and skip the bad response rather than aborting `learn()`.
+- **`max_tokens` raised on both clone prompts.** `seedClones` 1200 → 4096 and
+  `breedStrongClones` 600 → 4096 — the old limits routinely truncated nested
+  JSON responses. Both are now overridable via an `{ maxTokens }` option for
+  providers with lower ceilings.
+- **`embeddings` option on `new Marble()` now threads through to the Scorer.**
+  Previously the constructor accepted `embeddings` but the Scorer imported the
+  module singleton unconditionally — custom providers (for caching, retries,
+  alternative hosts) were silently ignored. Scorer constructor accepts
+  `{ embeddings }` as an option; `new Marble({ embeddings })` wires it through.
+- **Construction-time warnings de-duplicated across instances.** "No LLM
+  provider configured" and "No embeddings configured" warnings now fire at most
+  once per process, not once per `new Marble()`. Batch workloads that spin up
+  one instance per user/request/session no longer flood stderr.
+- **New `silent: true` constructor option** suppresses the above warnings
+  entirely for callers that know what they're doing.
+
 ### BREAKING CHANGES
 
 - **Package renamed**: `marblism` → `marble`

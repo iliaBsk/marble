@@ -15,6 +15,24 @@ import { readFile, writeFile } from 'fs/promises';
 import { extractEntityAttributes } from './entity-extractor.js';
 import { embeddings as defaultEmbeddings } from './embeddings.js';
 
+/**
+ * Tolerant JSON extraction from LLM text output.
+ *
+ * LLM completions can arrive empty, prose-wrapped, truncated mid-structure, or
+ * otherwise malformed. Callers MUST handle null rather than assuming success.
+ *
+ * @param {string} text
+ * @param {'object'|'array'} [shape='object']
+ * @returns {any|null}
+ */
+function _extractJSON(text, shape = 'object') {
+  if (!text || typeof text !== 'string') return null;
+  const re = shape === 'array' ? /\[[\s\S]*\]/ : /\{[\s\S]*\}/;
+  const m = text.match(re);
+  if (!m) return null;
+  try { return JSON.parse(m[0]); } catch { return null; }
+}
+
 export class KnowledgeGraph {
   constructor(dataPath) {
     this.dataPath = dataPath;
@@ -804,9 +822,16 @@ export class KnowledgeGraph {
    *
    * @param {Object} llm - LLM client from llm-provider.js
    * @param {string} model
+   * @param {Object} [opts]
+   * @param {number} [opts.maxTokens=4096] - LLM max_tokens. Default is generous
+   *   because the prompt asks for nested JSON (arrays of beliefs/preferences/
+   *   identities) and tighter limits truncate mid-structure. Lower only if your
+   *   provider caps below 4096.
    * @returns {Promise<import('./types.js').UserClone[]>}
    */
-  async seedClones(llm, model) {
+  async seedClones(llm, model, opts = {}) {
+    const maxTokens = opts.maxTokens ?? 4096;
+
     // Read gaps stored by CuriosityLoop (beliefs with key starting with gap:)
     const gapBeliefs = (this.user.beliefs || []).filter(b => b.topic?.startsWith('gap:'));
     const gaps = gapBeliefs.map(b => b.claim ?? b.value ?? b.topic.replace('gap:', ''));
@@ -844,11 +869,18 @@ Return ONLY the JSON array. No explanation.`;
 
     const resp = await llm.messages.create({
       model,
-      max_tokens: 1200,
+      max_tokens: maxTokens,
       messages: [{ role: 'user', content: prompt }],
     });
-    const text = resp.content[0].text;
-    const raw = JSON.parse(text.match(/\[[\s\S]*\]/)[0]);
+    const text = resp?.content?.[0]?.text;
+    const raw = _extractJSON(text, 'array');
+    if (!raw || !Array.isArray(raw)) {
+      console.warn(
+        '[kg.seedClones] LLM response did not contain a parseable JSON array — skipping seed. ' +
+        'Check LLM output length/truncation or provider health.'
+      );
+      return [];
+    }
     const now = Date.now();
     return raw.map((h, i) => ({
       id: `clone_seed_${now}_${i}`,
@@ -887,12 +919,23 @@ Return ONLY the JSON array. No explanation.`;
     }
   }
 
-  async breedStrongClones(llm, model) {
+  /**
+   * Breed a neighbouring archetype from every strong clone (confidence > 0.75).
+   *
+   * @param {Object} llm - LLM client from llm-provider.js
+   * @param {string} model
+   * @param {Object} [opts]
+   * @param {number} [opts.maxTokens=4096] - LLM max_tokens per breed call.
+   *   Tighter limits truncate the nested kgOverrides JSON.
+   */
+  async breedStrongClones(llm, model, opts = {}) {
+    const maxTokens = opts.maxTokens ?? 4096;
+
     const strong = this.getActiveClones().filter(c => c.confidence > 0.75);
     for (const parent of strong) {
       const resp = await llm.messages.create({
         model,
-        max_tokens: 600,
+        max_tokens: maxTokens,
         messages: [{
           role: 'user',
           content: `A user archetype hypothesis has proven strong (confidence > 0.75):
@@ -918,7 +961,14 @@ Return JSON:
 Return ONLY the JSON object.`,
         }],
       });
-      const raw = JSON.parse(resp.content[0].text.match(/\{[\s\S]*\}/)[0]);
+      const raw = _extractJSON(resp?.content?.[0]?.text, 'object');
+      if (!raw || typeof raw !== 'object') {
+        console.warn(
+          `[kg.breedStrongClones] LLM response for parent "${parent.id}" did not contain ` +
+          'parseable JSON object — skipping this parent. Check for truncation or prose wrapping.'
+        );
+        continue;
+      }
       this.saveClone({
         id: `clone_bred_${Date.now()}`,
         gap: raw.gap || parent.gap || '',

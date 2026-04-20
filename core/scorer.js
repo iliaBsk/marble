@@ -6,7 +6,7 @@
  */
 
 import { SCORE_WEIGHTS, MetricConfiguration, USE_CASE_CONFIGS } from './types.js';
-import { embeddings } from './embeddings.js';
+import { embeddings as defaultEmbeddings } from './embeddings.js';
 import { MetricDrivenScoringEngine } from './enterprise/metric-driven-scoring-engine.js';
 import { swarmScore, generateAgentFleet } from './swarm.js';
 import { globalCollaborativeFilter } from './collaborative-filter.js';
@@ -27,6 +27,12 @@ export class Scorer {
     // Threshold at which Marble stops leaning on popularity prior.
     // Default 10 means sparse profiles quickly shift to personalization signals.
     this.coldStartThreshold = options.coldStartThreshold ?? 10;
+    // Embeddings provider — injectable. Falls back to the module-level
+    // singleton (respects EMBEDDINGS_PROVIDER env var) when no provider is
+    // passed by the caller. Integrators that build custom providers (for
+    // caching, retries, alternative hosts) can pass them here via
+    // `new Marble({ embeddings })`, which threads through to the Scorer.
+    this.embeddings = options.embeddings || defaultEmbeddings;
 
     // Initialize metric-driven scoring engine
     if (this.metricConfig) {
@@ -504,7 +510,7 @@ export class Scorer {
     try {
       // Use semantic matching for preference alignment
       const preferenceTexts = userPreferences.map(p => p.description).filter(Boolean);
-      const bestMatch = await embeddings.findMostSimilar(storyText, preferenceTexts, 0.15);
+      const bestMatch = await this.embeddings.findMostSimilar(storyText, preferenceTexts, 0.15);
 
       if (bestMatch.similarity > 0) {
         const matchedPreference = userPreferences[bestMatch.index];
@@ -724,7 +730,7 @@ export class Scorer {
         .map(interest => typeof interest === 'string' ? interest : interest.name || interest.topic)
         .filter(Boolean);
 
-      const bestMatch = await embeddings.findMostSimilar(storyText, interestTexts, 0.2);
+      const bestMatch = await this.embeddings.findMostSimilar(storyText, interestTexts, 0.2);
 
       if (bestMatch && bestMatch.similarity > 0) {
         const semanticScore = Math.min(1, bestMatch.similarity * 1.2);
