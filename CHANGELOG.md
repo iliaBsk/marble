@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Improved — Scorer on topic-thin data + no-LLM mode (OOTB integration pass 3)
+
+- **`#interestMatch` no longer ties on items with empty `topics`.** When an
+  item has no tags (common for RSS without categories, text-only sources,
+  user-generated content), the scorer previously returned a flat 0.3 for every
+  such item — killing ranking differentiation. It now falls back to a pure
+  semantic match: embed the item's `title + summary`, compare to the user's
+  top interests, use the cosine similarity. Neutral 0.3 is only returned when
+  there is no text AND no embeddings AND no user interests to compare against.
+- **No-LLM mode now builds a real interest graph.** When `react()` is called
+  with an item that has no `topics` and no `TopicInsightEngine` is wired (i.e.
+  no LLM passed to the constructor), Marble now derives a small keyword set
+  from `item.title + summary` via a stopword-stripped top-N tokenizer and
+  uses them as fallback topics. Derived topics are marked `topics_derived:
+  true` on the history entry and receive a dampened interest boost (0.5×) to
+  reflect that they're heuristic, not user-curated.
+- **README now states that `learn()` is required for progressive improvement.**
+  `react()` / `feedbackBatch()` record signals, but clone evolution, the
+  inference engine, and the insight swarm only update inside `learn()`.
+  Typical integrations call it every N reactions or on a daily schedule.
+
 ### Added — Provider generalization (OOTB integration pass 2)
 
 - **New `openai-compatible` LLM provider.** Any OpenAI-compatible host
