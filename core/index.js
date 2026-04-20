@@ -18,6 +18,34 @@ import { Swarm } from './swarm.js';
 import { Clone } from './clone.js';
 import { decayPass } from './decay.js';
 
+// Module-level flags so missing-provider warnings fire at most once per
+// process, not once per `new Marble()`. Batch workloads (one instance per
+// user/request/session) would otherwise flood stderr with duplicates.
+let _warnedNoLLM = false;
+let _warnedNoEmbeddings = false;
+
+/**
+ * Thrown by `learn({ allowDegraded: false })` when one or more pipeline stages
+ * failed. Exposes both the per-stage failures and the partial result so
+ * callers can log or partially use what did succeed. Use this to distinguish
+ * "healthy-but-cold" (no failures, zero counts) from "silent-degraded"
+ * (failures collected, zero counts).
+ */
+export class LearnDegradedError extends Error {
+  /**
+   * @param {Array<{ stage: string, code?: string, message: string }>} failures
+   * @param {Object} result - The partial learn() result that would otherwise
+   *   have been returned.
+   */
+  constructor(failures, result) {
+    const summary = failures.map(f => `${f.stage}: ${f.message}`).join('; ');
+    super(`learn() completed with degraded stages — ${summary}`);
+    this.name = 'LearnDegradedError';
+    this.failures = failures;
+    this.result = result;
+  }
+}
+
 export class Marble {
   /**
    * @param {Object} opts
@@ -29,6 +57,7 @@ export class Marble {
    * @param {boolean}  [opts.arcReorder=false] - Apply narrative arc reranking (newsletter/content curation only)
    * @param {number}   [opts.coldStartThreshold=10] - Signals needed before full personalization
    * @param {number}   [opts.cloneBoostWeight=0.3] - How much clone consensus influences scoring
+   * @param {boolean}  [opts.silent=false] - Suppress construction-time warnings about missing providers
    */
   constructor({
     storage = './marble-kg.json',
@@ -39,9 +68,10 @@ export class Marble {
     arcReorder = false,
     coldStartThreshold = 10,
     cloneBoostWeight = 0.3,
+    silent = false,
   } = {}) {
     this.kg = new KnowledgeGraph(storage);
-    this.scorer = new Scorer(this.kg, { coldStartThreshold });
+    this.scorer = new Scorer(this.kg, { coldStartThreshold, embeddings });
     this.arc = new ArcReranker();
     this.count = count;
     this.mode = mode;
@@ -55,13 +85,17 @@ export class Marble {
     this.clonePopulation = null;
     this.feedbackEngine = null;
 
-    if (!llm) {
+    if (!silent && !llm && !_warnedNoLLM) {
+      _warnedNoLLM = true;
       console.warn('[Marble] No LLM provider configured. Only L0+L1 scoring available. '
-        + 'Pass { llm: yourLLMFunction } for full pipeline (L1.5, L2, L3).');
+        + 'Pass { llm: yourLLMFunction } for full pipeline (L1.5, L2, L3). '
+        + 'Pass { silent: true } to suppress this warning.');
     }
-    if (!embeddings && !process.env.OPENAI_API_KEY) {
+    if (!silent && !embeddings && !process.env.OPENAI_API_KEY && !_warnedNoEmbeddings) {
+      _warnedNoEmbeddings = true;
       console.warn('[Marble] No embeddings configured. Scorer will use keyword matching only. '
-        + 'Set OPENAI_API_KEY or pass { embeddings: provider } for semantic scoring.');
+        + 'Set OPENAI_API_KEY or pass { embeddings: provider } for semantic scoring. '
+        + 'Pass { silent: true } to suppress this warning.');
     }
   }
 
@@ -81,13 +115,29 @@ export class Marble {
   }
 
   /**
-   * Score and rank items. Uses clone consensus when clones exist.
+   * Score and rank ALL items without slicing or arc reordering.
    *
-   * @param {Object[]} items - Candidate items (~100)
+   * Use this when you need the full ranking distribution — AUC / MRR
+   * evaluations, external rerankers, or surfacing more than `count` results.
+   * For top-N-with-optional-arc-ordering, use `select()` instead.
+   *
+   * The returned objects preserve the scorer's wrapper shape. Each has:
+   *   - `story`: the original input item (historical name, see `item` alias below)
+   *   - `item`: alias for `story` — use this in new code; `story` will be
+   *     deprecated in a future major
+   *   - `relevance_score`: number in [0, 1], the composite ranking signal
+   *   - `magic_score`: legacy alias of relevance_score kept for back-compat
+   *   - plus per-dimension components (`interest_match`, `temporal_relevance`,
+   *     `popularity_score`, `entity_affinity`, ...) when produced by the
+   *     scorer path; swarm/debate modes may populate a different subset
+   *
+   * Ordered descending by `relevance_score`; ties broken by `popularity_score`.
+   *
+   * @param {Object[]} items - Candidate items
    * @param {Object}   [context] - Ephemeral context (calendar, projects, mood)
-   * @returns {Object[]} Top items, arc-ordered
+   * @returns {Promise<Array<{ story: Object, item: Object, relevance_score: number, magic_score: number, [key: string]: any }>>}
    */
-  async select(items, context) {
+  async score(items, context) {
     if (!this.ready) await this.init();
 
     if (context) {
@@ -100,7 +150,7 @@ export class Marble {
       const swarm = new Swarm(this.kg, {
         mode: this.mode === 'debate' ? 'debate' : 'deep',
         llm: this.llm,
-        topN: this.count,
+        topN: items.length,
       });
       scored = await swarm.curate(items);
     } else {
@@ -128,6 +178,38 @@ export class Marble {
         (b.relevance_score ?? b.magic_score ?? 0) - (a.relevance_score ?? a.magic_score ?? 0)
       );
     }
+
+    // Non-breaking alias: wrapper.story → wrapper.item. Callers can start using
+    // `.item` immediately; `.story` is preserved for existing downstream code
+    // and will be deprecated in a future major version.
+    for (const entry of scored) {
+      if (entry && typeof entry === 'object' && entry.story && entry.item === undefined) {
+        entry.item = entry.story;
+      }
+    }
+
+    return scored;
+  }
+
+  /**
+   * Score and return the top `count` items, with optional arc reordering.
+   *
+   * Convenience wrapper around `score()` for the common "give me the top N"
+   * case. Identical scoring pipeline; differences:
+   *   - returns only the first `this.count` entries
+   *   - applies narrative arc reranking when `arcReorder: true` was passed
+   *     to the constructor (newsletter/content-curation use cases)
+   *
+   * For full-slate output (evaluations, external rerankers, large result
+   * sets), use `score()` instead.
+   *
+   * @param {Object[]} items - Candidate items (~100 typical)
+   * @param {Object}   [context] - Ephemeral context (calendar, projects, mood)
+   * @returns {Promise<Array<{ story: Object, item: Object, relevance_score: number, magic_score: number, [key: string]: any }>>}
+   *   Top `count` items, same wrapper shape as `score()`, optionally arc-ordered.
+   */
+  async select(items, context) {
+    const scored = await this.score(items, context);
 
     // Arc reranking is opt-in: only for newsletter/content-curation use cases
     // where narrative flow matters. For search, product recs, etc., keep pure ranking.
@@ -201,53 +283,145 @@ export class Marble {
    * Run deep learning: L1.5 insight swarm → L2 inference → L3 clone evolution.
    * Call daily or after N reactions accumulate.
    *
-   * @returns {Promise<{ insights: number, candidates: number, clones: number }>}
+   * Each stage runs inside its own try/catch so a failure in one layer does
+   * not abort the pipeline — the remaining stages still execute on whatever
+   * data is available. Per-stage outcomes are surfaced in `stages`; any
+   * thrown errors are collected in `failures`. Callers that want the old
+   * "throw on any degradation" behaviour should pass `{ allowDegraded: false }`
+   * and check `failures.length === 0`.
+   *
+   * Distinguishes healthy-but-cold from silent-degraded:
+   *   - `{ insights: 0, candidates: 0, clones: 0, failures: [] }` → healthy cold start
+   *   - `{ insights: 0, candidates: 0, clones: 0, failures: [ ... ] }` → degraded; inspect failures
+   *
+   * @param {Object} [opts]
+   * @param {boolean} [opts.allowDegraded=true] - When false, throws
+   *   LearnDegradedError if any stage fails. Default true so callers that
+   *   don't read `failures` still get a usable result.
+   * @returns {Promise<{
+   *   insights: number,
+   *   candidates: number,
+   *   clones: number,
+   *   stages: { seedClones: 'skipped'|'ok'|'failed', insightSwarm: 'ok'|'failed', inference: 'ok'|'failed', cloneEvolution: 'skipped'|'ok'|'failed' },
+   *   failures: Array<{ stage: string, code?: string, message: string }>
+   * }>}
    */
-  async learn() {
+  async learn(opts = {}) {
+    const { allowDegraded = true } = opts;
     if (!this.llm) {
       throw new Error('learn() requires an LLM provider. Pass { llm: yourLLMFunction } in constructor.');
     }
     if (!this.ready) await this.init();
 
-    // Seed clones if none exist
+    const stages = {
+      seedClones: 'skipped',
+      insightSwarm: 'skipped',
+      inference: 'skipped',
+      cloneEvolution: 'skipped',
+    };
+    const failures = [];
+    const pushFailure = (stage, err) => {
+      failures.push({
+        stage,
+        code: err?.code,
+        message: err?.message || String(err),
+      });
+    };
+
+    // Seed clones if none exist. Persist the returned array — historically
+    // the result was discarded, so seeded clones never reached `user.clones`
+    // and every downstream `clones === 0` check looked identical to a cold
+    // start. Now we save each clone and the seed failure (if any) shows up
+    // in `failures` instead of being buried in stderr.
     const existingClones = this.kg.getActiveClones();
     if (existingClones.length === 0 && typeof this.kg.seedClones === 'function') {
-      const { createLLMClient } = await import('./llm-provider.js');
-      const client = createLLMClient();
-      await this.kg.seedClones(client, client.defaultModel('fast'));
+      try {
+        const { createLLMClient } = await import('./llm-provider.js');
+        const client = createLLMClient();
+        const seeded = await this.kg.seedClones(client, client.defaultModel('fast'));
+        if (Array.isArray(seeded) && seeded.length > 0) {
+          for (const clone of seeded) this.kg.saveClone(clone);
+          stages.seedClones = 'ok';
+        } else {
+          // Empty return can mean either "nothing to seed" (no known data)
+          // or a parse failure captured as `_lastSeedCloneError`. Only the
+          // latter counts as a failure.
+          const seedErr = this.kg._lastSeedCloneError;
+          if (seedErr) {
+            stages.seedClones = 'failed';
+            pushFailure('seedClones', seedErr);
+          } else {
+            stages.seedClones = 'ok';
+          }
+        }
+      } catch (err) {
+        stages.seedClones = 'failed';
+        pushFailure('seedClones', err);
+      }
+    } else {
+      stages.seedClones = 'ok';
     }
 
     // L1.5: Insight Swarm — probe psychological dimensions
-    const { runInsightSwarm } = await import('./insight-swarm.js');
-    const insights = await runInsightSwarm(this.kg);
-
-    // L2: Inference Engine — generate candidates from L1 facts + L1.5 insights
-    const { InferenceEngine } = await import('./inference-engine.js');
-    const inference = new InferenceEngine(this.kg);
-    const candidates = await inference.run();
-
-    // L3: Clone evolution — evaluate, merge, kill, breed
-    const { ClonePopulation } = await import('./evolution.js');
-    if (!this.clonePopulation) {
-      this.clonePopulation = new ClonePopulation(this.kg, this.llm);
+    let insights = [];
+    try {
+      const { runInsightSwarm } = await import('./insight-swarm.js');
+      insights = await runInsightSwarm(this.kg);
+      stages.insightSwarm = 'ok';
+    } catch (err) {
+      stages.insightSwarm = 'failed';
+      pushFailure('insightSwarm', err);
     }
 
-    const recentReactions = (this.kg.user.history || []).slice(-10).map(h => ({
-      item: { title: h.item_id || h.story_id, topics: h.topics, id: h.item_id || h.story_id },
-      reaction: h.reaction,
-    }));
+    // L2: Inference Engine — generate candidates from L1 facts + L1.5 insights
+    let candidates = [];
+    try {
+      const { InferenceEngine } = await import('./inference-engine.js');
+      const inference = new InferenceEngine(this.kg);
+      candidates = await inference.run();
+      stages.inference = 'ok';
+    } catch (err) {
+      stages.inference = 'failed';
+      pushFailure('inference', err);
+    }
 
-    if (recentReactions.length > 0) {
-      await this.clonePopulation.evolve(recentReactions);
+    // L3: Clone evolution — evaluate, merge, kill, breed
+    try {
+      const { ClonePopulation } = await import('./evolution.js');
+      if (!this.clonePopulation) {
+        this.clonePopulation = new ClonePopulation(this.kg, this.llm);
+      }
+
+      const recentReactions = (this.kg.user.history || []).slice(-10).map(h => ({
+        item: { title: h.item_id || h.story_id, topics: h.topics, id: h.item_id || h.story_id },
+        reaction: h.reaction,
+      }));
+
+      if (recentReactions.length > 0) {
+        await this.clonePopulation.evolve(recentReactions);
+        stages.cloneEvolution = 'ok';
+      }
+    } catch (err) {
+      stages.cloneEvolution = 'failed';
+      pushFailure('cloneEvolution', err);
     }
 
     await this.kg.save();
 
-    return {
-      insights: insights.length,
+    const result = {
+      insights: Array.isArray(insights) ? insights.length : 0,
       candidates: Array.isArray(candidates) ? candidates.length : 0,
       clones: this.kg.getActiveClones().length,
+      stages,
+      failures,
     };
+
+    if (!allowDegraded && failures.length > 0) {
+      const err = new LearnDegradedError(failures, result);
+      throw err;
+    }
+
+    return result;
   }
 
   /**

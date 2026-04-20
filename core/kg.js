@@ -15,6 +15,206 @@ import { readFile, writeFile } from 'fs/promises';
 import { extractEntityAttributes } from './entity-extractor.js';
 import { embeddings as defaultEmbeddings } from './embeddings.js';
 
+/**
+ * Walk `src` and return a version with any unclosed `{`, `[`, or `"` closed
+ * at the end. Designed to rescue LLM JSON that was truncated mid-structure
+ * by a max_tokens ceiling. Skips escapes and string literals so braces inside
+ * strings don't confuse the depth tracker. Strips a trailing comma if one
+ * dangles before the synthetic closers.
+ *
+ * This is best-effort — if the input was already structurally invalid (not
+ * just truncated), the result will still fail JSON.parse and the caller gets
+ * null. No guarantees about semantic correctness: a rescued object is at
+ * least parseable, not necessarily complete.
+ *
+ * @param {string} src
+ * @returns {string}
+ */
+function _balanceBraces(src) {
+  const stack = [];
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (escape) { escape = false; continue; }
+    if (inString) {
+      if (ch === '\\') escape = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === '{' || ch === '[') stack.push(ch);
+    else if (ch === '}' || ch === ']') stack.pop();
+  }
+  let tail = '';
+  if (inString) tail += '"';
+  // Drop a dangling comma that would otherwise appear right before the synthetic closers.
+  let trimmed = src.replace(/,\s*$/, '');
+  // Drop a half-written key-value pair at the end (e.g. `"salience":` with no value).
+  trimmed = trimmed.replace(/,?\s*"[^"]*"\s*:\s*$/, '');
+  while (stack.length) {
+    const open = stack.pop();
+    tail += open === '{' ? '}' : ']';
+  }
+  return trimmed + tail;
+}
+
+/**
+ * Tolerant JSON extraction from LLM text output.
+ *
+ * LLM completions can arrive empty, prose-wrapped, truncated mid-structure, or
+ * otherwise malformed. This helper applies three recovery layers in order:
+ *   1. Match the outermost JSON region and parse it directly.
+ *   2. If parse fails, attempt brace-balance recovery on the matched region.
+ *   3. If that fails, match the innermost opener and re-balance from there —
+ *      rescues the common "prose + truncated JSON" shape.
+ * Callers MUST still handle null.
+ *
+ * @param {string} text
+ * @param {'object'|'array'} [shape='object']
+ * @returns {any|null}
+ */
+function _extractJSON(text, shape = 'object') {
+  if (!text || typeof text !== 'string') return null;
+  const opener = shape === 'array' ? '[' : '{';
+  const re = shape === 'array' ? /\[[\s\S]*\]/ : /\{[\s\S]*\}/;
+  const m = text.match(re);
+  const candidate = m ? m[0] : null;
+  if (candidate) {
+    try { return JSON.parse(candidate); } catch { /* fall through to rescue */ }
+    try { return JSON.parse(_balanceBraces(candidate)); } catch { /* fall through */ }
+  }
+  // Last resort: start from the first opener we find and balance to EOF. This
+  // catches truncations where the closing bracket was never emitted, so the
+  // greedy regex above didn't match at all.
+  const start = text.indexOf(opener);
+  if (start >= 0) {
+    try { return JSON.parse(_balanceBraces(text.slice(start))); } catch { return null; }
+  }
+  return null;
+}
+
+/**
+ * Coerce an LLM-produced belief/preference/identity entry into the object
+ * shape the rest of the KG expects. LLMs frequently return string arrays
+ * instead of the documented object arrays; silently dropping those is worse
+ * than accepting them with sensible defaults.
+ *
+ * @param {any} entry
+ * @param {'belief'|'preference'|'identity'} kind
+ * @returns {Object|null}
+ */
+function _normalizeKgOverrideEntry(entry, kind) {
+  if (entry == null) return null;
+  if (typeof entry === 'string') {
+    const s = entry.trim();
+    if (!s) return null;
+    if (kind === 'belief') return { topic: s, value: s, confidence: 0.5 };
+    if (kind === 'preference') return { category: 'general', value: s, strength: 0.5 };
+    if (kind === 'identity') return { role: 'general', value: s, salience: 0.5 };
+  }
+  if (typeof entry !== 'object') return null;
+  // Object case: fill in any missing required fields rather than leaving
+  // downstream code to read `undefined` off the structure.
+  if (kind === 'belief') {
+    const topic = entry.topic ?? entry.name ?? entry.key ?? entry.value ?? '';
+    if (!topic) return null;
+    return {
+      ...entry,
+      topic,
+      value: entry.value ?? entry.claim ?? topic,
+      confidence: typeof entry.confidence === 'number' ? entry.confidence : 0.5,
+    };
+  }
+  if (kind === 'preference') {
+    const value = entry.value ?? entry.preference ?? entry.name ?? '';
+    if (!value && !entry.category) return null;
+    return {
+      ...entry,
+      category: entry.category ?? 'general',
+      value: value || entry.category,
+      strength: typeof entry.strength === 'number' ? entry.strength : 0.5,
+    };
+  }
+  if (kind === 'identity') {
+    const value = entry.value ?? entry.identity ?? entry.name ?? '';
+    if (!value && !entry.role) return null;
+    return {
+      ...entry,
+      role: entry.role ?? 'general',
+      value: value || entry.role,
+      salience: typeof entry.salience === 'number' ? entry.salience : 0.5,
+    };
+  }
+  return null;
+}
+
+/**
+ * Normalize an entire `kgOverrides` block. Accepts missing keys, string-shaped
+ * entries, and arrays-of-objects with partial fields. Always returns the
+ * three-key structure so downstream code can index without existence checks.
+ *
+ * @param {any} raw
+ * @returns {{ beliefs: Object[], preferences: Object[], identities: Object[] }}
+ */
+function _normalizeKgOverrides(raw) {
+  const safe = (raw && typeof raw === 'object') ? raw : {};
+  const map = (arr, kind) =>
+    (Array.isArray(arr) ? arr : [])
+      .map(e => _normalizeKgOverrideEntry(e, kind))
+      .filter(Boolean);
+  return {
+    beliefs: map(safe.beliefs, 'belief'),
+    preferences: map(safe.preferences, 'preference'),
+    identities: map(safe.identities, 'identity'),
+  };
+}
+
+// Minimal English stopword list for the no-LLM keyword fallback. Kept tiny to
+// avoid pulling in a dependency; the goal is "better than empty", not
+// production-grade NLP.
+const _STOPWORDS = new Set([
+  'a','an','the','and','or','but','if','then','than','so','of','to','for','in',
+  'on','at','by','with','from','about','into','over','under','between','through',
+  'is','are','was','were','be','been','being','have','has','had','do','does','did',
+  'will','would','could','should','may','might','must','can','cannot','this','that',
+  'these','those','i','you','he','she','it','we','they','them','their','our','your',
+  'my','me','us','as','not','no','yes','also','just','very','really','its','it\'s',
+  'up','down','out','off','too','any','some','all','more','most','much','many',
+  'one','two','three','like','get','got','go','going','gone','see','seen','saw',
+  'make','made','take','taken','took','find','found','come','came','come','gone',
+  'new','old','now','then','here','there','where','when','what','why','how','who',
+  'which','whose','been','being','being','not','don','doesn','isn','wasn','weren',
+]);
+
+/**
+ * Lightweight keyword extractor for the no-LLM mode. Splits on non-word chars,
+ * drops short tokens and stopwords, returns up to `limit` most-frequent tokens.
+ *
+ * This is a deliberately simple fallback — when no TopicInsightEngine is wired
+ * and the caller hands `react()` an item with no `topics`, we at least derive
+ * something the scorer can use rather than leaving the KG completely topic-thin.
+ *
+ * @param {string} text
+ * @param {number} [limit=5]
+ * @returns {string[]}
+ */
+function _extractKeywordsFromText(text, limit = 5) {
+  if (!text || typeof text !== 'string') return [];
+  const freq = new Map();
+  const tokens = text.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  for (const t of tokens) {
+    if (t.length < 3) continue;
+    if (_STOPWORDS.has(t)) continue;
+    if (/^\d+$/.test(t)) continue;
+    freq.set(t, (freq.get(t) || 0) + 1);
+  }
+  return [...freq.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([k]) => k);
+}
+
 export class KnowledgeGraph {
   constructor(dataPath) {
     this.dataPath = dataPath;
@@ -107,12 +307,34 @@ export class KnowledgeGraph {
    * @param {Object} [item=null] - Optional item metadata for secondary context extraction
    */
   recordReaction(itemId, reaction, topics, source, item = null) {
+    // No-LLM keyword fallback: when no TopicInsightEngine is wired and the
+    // caller provided no topics, derive a small keyword set from the item's
+    // title/summary so the interest graph gets a signal (otherwise every
+    // reaction in no-LLM mode contributes zero to the scorer's interest match).
+    // Marked derivedTopics on the history entry so downstream code can weight
+    // them lower if desired — they are a heuristic fallback, not user-curated.
+    let effectiveTopics = topics;
+    let derivedTopics = false;
+    if (
+      (!effectiveTopics || effectiveTopics.length === 0) &&
+      !this._topicInsightEngine &&
+      item
+    ) {
+      const text = `${item.title || ''} ${item.summary || item.description || ''}`.trim();
+      const kws = _extractKeywordsFromText(text);
+      if (kws.length) {
+        effectiveTopics = kws;
+        derivedTopics = true;
+      }
+    }
+
     const historyEntry = {
       item_id: itemId,
       reaction,
       date: new Date().toISOString(),
-      topics,
-      source
+      topics: effectiveTopics,
+      source,
+      ...(derivedTopics && { topics_derived: true }),
     };
 
     // Extract and store secondary context if item metadata provided
@@ -137,12 +359,15 @@ export class KnowledgeGraph {
 
     this.user.history.push(historyEntry);
 
-    // Update interest weights based on reaction
-    for (const topic of topics) {
+    // Update interest weights based on reaction. Derived-keyword topics get a
+    // dampened boost (half the normal rate) since they are heuristic, not
+    // user-declared.
+    const boostMultiplier = derivedTopics ? 0.5 : 1.0;
+    for (const topic of effectiveTopics || []) {
       if (reaction === 'up' || reaction === 'share') {
-        this.boostInterest(topic, reaction === 'share' ? 0.15 : 0.1);
+        this.boostInterest(topic, (reaction === 'share' ? 0.15 : 0.1) * boostMultiplier);
       } else if (reaction === 'down') {
-        this.decayInterest(topic, 0.05);
+        this.decayInterest(topic, 0.05 * boostMultiplier);
       }
     }
 
@@ -802,11 +1027,30 @@ export class KnowledgeGraph {
    * Each gap becomes one or more clones with concrete kgOverrides representing
    * a specific hypothesis about how that gap resolves.
    *
+   * Two prompt paths:
+   *   - Cold start (no gaps yet): asks for a small number of short archetypes
+   *     derived from known interests/preferences, with a tight token budget.
+   *     This is the very first `learn()` call on a user — trying to reason
+   *     about "unknown gaps" from near-empty data makes LLMs ramble or emit
+   *     prose; the short-form prompt keeps them on-task.
+   *   - Warm path (gaps present): full archetype prompt, generous budget.
+   *
    * @param {Object} llm - LLM client from llm-provider.js
    * @param {string} model
+   * @param {Object} [opts]
+   * @param {number} [opts.maxTokens=8192] - LLM max_tokens. Default is 8192
+   *   because the prompt asks for nested JSON (arrays of beliefs/preferences/
+   *   identities) and any meaningful archetype easily exceeds 4096 tokens
+   *   mid-structure on typical providers. Lower only if your provider caps
+   *   below 8192.
+   * @param {number} [opts.coldStartMaxTokens=1500] - Tighter budget for the
+   *   cold-start branch where the prompt explicitly requests brevity.
    * @returns {Promise<import('./types.js').UserClone[]>}
    */
-  async seedClones(llm, model) {
+  async seedClones(llm, model, opts = {}) {
+    const maxTokens = opts.maxTokens ?? 8192;
+    const coldStartMaxTokens = opts.coldStartMaxTokens ?? 1500;
+
     // Read gaps stored by CuriosityLoop (beliefs with key starting with gap:)
     const gapBeliefs = (this.user.beliefs || []).filter(b => b.topic?.startsWith('gap:'));
     const gaps = gapBeliefs.map(b => b.claim ?? b.value ?? b.topic.replace('gap:', ''));
@@ -818,13 +1062,35 @@ export class KnowledgeGraph {
       interests: this.user.interests?.slice(0, 5),
     };
 
-    const prompt = `You are building an archetype model of a user.
+    const isColdStart = gaps.length === 0;
+    const prompt = isColdStart
+      ? `You are building an archetype model of a user from sparse initial data.
+
+Known facts about the user:
+${JSON.stringify(known, null, 2)}
+
+Produce exactly 2 short archetype hypotheses that represent meaningfully different plausible versions of this user based on the known data. Keep it compact — no more than 3 beliefs, 3 preferences, and 2 identities per archetype. Keep the total response under ${Math.floor(coldStartMaxTokens * 0.6)} tokens.
+
+Return a JSON array. Each element:
+{
+  "gap": "<one-line open question about this user>",
+  "hypothesis": "<short description of this user variant>",
+  "kgOverrides": {
+    "beliefs": [{ "topic": "...", "value": "...", "confidence": 0.7 }],
+    "preferences": [{ "category": "...", "value": "...", "strength": 0.7 }],
+    "identities": [{ "role": "...", "value": "...", "salience": 0.7 }]
+  },
+  "confidence": 0.5
+}
+
+Return ONLY the JSON array. No prose, no explanation.`
+      : `You are building an archetype model of a user.
 
 Known facts about the user:
 ${JSON.stringify(known, null, 2)}
 
 Unresolved knowledge gaps:
-${gaps.length ? gaps.map((g, i) => `${i + 1}. ${g}`).join('\n') : '(none provided — infer gaps from the known data)'}
+${gaps.map((g, i) => `${i + 1}. ${g}`).join('\n')}
 
 For each gap, create 1–2 concrete archetype hypotheses that represent meaningfully different versions of this user. Each hypothesis must include specific kgOverrides — concrete beliefs, preferences, and identities this version of the user would hold.
 
@@ -844,21 +1110,31 @@ Return ONLY the JSON array. No explanation.`;
 
     const resp = await llm.messages.create({
       model,
-      max_tokens: 1200,
+      max_tokens: isColdStart ? coldStartMaxTokens : maxTokens,
       messages: [{ role: 'user', content: prompt }],
     });
-    const text = resp.content[0].text;
-    const raw = JSON.parse(text.match(/\[[\s\S]*\]/)[0]);
+    const text = resp?.content?.[0]?.text;
+    const raw = _extractJSON(text, 'array');
+    if (!raw || !Array.isArray(raw)) {
+      const err = new Error(
+        '[kg.seedClones] LLM response did not contain a parseable JSON array. ' +
+        'Check LLM output length/truncation or provider health.'
+      );
+      err.stage = 'seedClones';
+      err.code = 'LLM_UNPARSEABLE';
+      console.warn(err.message + ' — skipping seed.');
+      // Attach the failure to the KG so `learn()` can surface it without
+      // changing the array-return contract of this method.
+      this._lastSeedCloneError = err;
+      return [];
+    }
+    this._lastSeedCloneError = null;
     const now = Date.now();
     return raw.map((h, i) => ({
       id: `clone_seed_${now}_${i}`,
       gap: h.gap || '',
       hypothesis: h.hypothesis,
-      kgOverrides: {
-        beliefs: h.kgOverrides?.beliefs || [],
-        preferences: h.kgOverrides?.preferences || [],
-        identities: h.kgOverrides?.identities || [],
-      },
+      kgOverrides: _normalizeKgOverrides(h.kgOverrides),
       confidence: h.confidence ?? 0.5,
       evaluations: [],
       spawnedFrom: null,
@@ -887,12 +1163,28 @@ Return ONLY the JSON array. No explanation.`;
     }
   }
 
-  async breedStrongClones(llm, model) {
+  /**
+   * Breed a neighbouring archetype from every strong clone (confidence > 0.75).
+   *
+   * @param {Object} llm - LLM client from llm-provider.js
+   * @param {string} model
+   * @param {Object} [opts]
+   * @param {number} [opts.maxTokens=8192] - LLM max_tokens per breed call.
+   *   Tighter limits truncate the nested kgOverrides JSON.
+   * @returns {Promise<{ bred: number, failures: Error[] }>} Per-call diagnostics —
+   *   callers that want to surface degraded runs (e.g. `learn()`) can inspect
+   *   `failures` instead of relying on stderr warnings.
+   */
+  async breedStrongClones(llm, model, opts = {}) {
+    const maxTokens = opts.maxTokens ?? 8192;
+    const failures = [];
+    let bred = 0;
+
     const strong = this.getActiveClones().filter(c => c.confidence > 0.75);
     for (const parent of strong) {
       const resp = await llm.messages.create({
         model,
-        max_tokens: 600,
+        max_tokens: maxTokens,
         messages: [{
           role: 'user',
           content: `A user archetype hypothesis has proven strong (confidence > 0.75):
@@ -918,16 +1210,24 @@ Return JSON:
 Return ONLY the JSON object.`,
         }],
       });
-      const raw = JSON.parse(resp.content[0].text.match(/\{[\s\S]*\}/)[0]);
+      const raw = _extractJSON(resp?.content?.[0]?.text, 'object');
+      if (!raw || typeof raw !== 'object') {
+        const err = new Error(
+          `[kg.breedStrongClones] LLM response for parent "${parent.id}" did not contain ` +
+          'parseable JSON object — skipping this parent. Check for truncation or prose wrapping.'
+        );
+        err.stage = 'breedStrongClones';
+        err.code = 'LLM_UNPARSEABLE';
+        err.parentId = parent.id;
+        console.warn(err.message);
+        failures.push(err);
+        continue;
+      }
       this.saveClone({
         id: `clone_bred_${Date.now()}`,
         gap: raw.gap || parent.gap || '',
         hypothesis: raw.hypothesis,
-        kgOverrides: {
-          beliefs: raw.kgOverrides?.beliefs || [],
-          preferences: raw.kgOverrides?.preferences || [],
-          identities: raw.kgOverrides?.identities || [],
-        },
+        kgOverrides: _normalizeKgOverrides(raw.kgOverrides),
         confidence: raw.confidence ?? 0.5,
         evaluations: [],
         spawnedFrom: parent.id,
@@ -936,6 +1236,8 @@ Return ONLY the JSON object.`,
         lastScoredAt: Date.now(),
         status: 'active',
       });
+      bred += 1;
     }
+    return { bred, failures };
   }
 }
