@@ -141,6 +141,15 @@ await marble.feedbackBatch([
 // Run the deep learning pipeline (L1.5 insight swarm → L2 inference → L3 clone evolution)
 const stats = await marble.learn();
 // { insights: 7, candidates: 4, clones: 12 }
+
+// (Optional) L2 trait synthesis — derives structured traits with replication,
+// contradiction, and emergent-fusion origins. Persists to kg.user.syntheses[].
+await marble.synthesize();
+
+// (Optional) Churn scan + salience diagnostic. Detects "serial pivoter"-style
+// traits that live in the time series of belief invalidations, and reports
+// how many of the KG's nodes are stale-active one-offs.
+const { churnSyntheses, distribution } = await marble.rebuild();
 ```
 
 > **`learn()` is required for the "Day 2 > Day 1" progressive improvement claim.**
@@ -149,6 +158,11 @@ const stats = await marble.learn();
 > `learn()`. A typical integration calls `learn()` after every N reactions
 > (e.g. N=10) or on a daily schedule. Without it, ranking relies on interest
 > aggregation alone and will not show clone-driven improvements over time.
+>
+> **`synthesize()` and `rebuild()` are optional** and run on their own schedule —
+> `synthesize()` is LLM-heavy (per-node trait extraction) so daily/weekly is
+> typical; `rebuild()` is cheap and deterministic, safe to run on every
+> `learn()` or on a cron.
 
 **Run tests:**
 
@@ -164,6 +178,8 @@ cd marble && npm install && npm test
 - **Three modes** — Score (fast), Swarm (rich), WorldSim (B2B PMF)
 - **Implicit learning** — Learns from dwell time, scroll depth, forwards, silence
 - **Insight-driven KG** — Reasons about WHY, not just WHAT (see [docs/insight-kg.md](docs/insight-kg.md))
+- **Trait synthesis** — Structured cross-domain traits with five origin types (`single_node`, `trait_replication`, `contradiction`, `emergent_fusion`, `churn_pattern`) — downstream tools match against `traits` / `affinities` / `aversions` as predicates, not prose labels
+- **Salience-aware** — `getTopSalient()` filters for important nodes before any pairwise pass; stale one-off facts fade automatically; churn scan surfaces "serial pivoter" traits that live in the time series of invalidations
 - **Relationship-aware** — Models the people in a user's life to improve recommendations
 - **Narrative arc** — Stories sequenced for flow, not just ranked by score
 
@@ -186,8 +202,18 @@ cd marble && npm install && npm test
 │  Telegram, Email, JSON API, Webhook, Video         │
 ├──────────────────────────────────────────────────┤
 │  5. LEARN                                         │
-│  Implicit signals → KG updates → Clone evolution   │
-│  → Better predictions daily                        │
+│  L1.5 Insight Swarm (7 psychological lenses)       │
+│  → L2 Inference + Temporal Patterns                │
+│  → L3 Clone Evolution (kill bottom 20%, mutate)    │
+├──────────────────────────────────────────────────┤
+│  6. SYNTHESIZE (optional, LLM-heavy)              │
+│  Trait extraction → Replication grouping           │
+│  → Contradiction detection → K-way fusion          │
+│  → kg.user.syntheses[] (5 origin types)            │
+├──────────────────────────────────────────────────┤
+│  7. REBUILD (optional, deterministic)             │
+│  Churn scan (slots reassigned ≥3× in 180d)         │
+│  + Salience distribution diagnostic                │
 └──────────────────────────────────────────────────┘
 ```
 
@@ -229,18 +255,24 @@ Five agents, each asking a different question:
 
 ```
 marble/
-├── core/                 # The engine (standalone)
-│   ├── index.js         # Main Marble class — select(), react(), save()
-│   ├── kg.js            # Insight-driven knowledge graph (v2)
-│   ├── scorer.js        # magic_score computation
-│   ├── swarm.js         # Multi-agent curation (5 lenses)
-│   ├── clone.js         # Digital twin — user snapshot for simulation
-│   ├── evolution.js     # Clone population evolution
-│   ├── signals.js       # Implicit signal detection
-│   ├── arc.js           # Narrative arc reranking (10 slots)
-│   ├── decay.js         # Exponential decay (14-day half-life)
-│   ├── embeddings.js    # Local ONNX embeddings (384-dim)
-│   └── types.js         # Type definitions, weights
+├── core/                   # The engine (standalone)
+│   ├── index.js           # Main Marble class — select/react/learn/synthesize/rebuild
+│   ├── kg.js              # Insight-driven knowledge graph (v2)
+│   ├── scorer.js          # magic_score computation
+│   ├── swarm.js           # Multi-agent curation (5 lenses)
+│   ├── insight-swarm.js   # L1.5 psychological probe committee (7 lenses)
+│   ├── inference-engine.js# L2 inference: L1.5 passthrough + temporal patterns
+│   ├── trait-synthesis.js # L2 trait synthesis (4 origins) — per-node extraction,
+│   │                      # replication, contradiction, K-way fusion
+│   ├── salience.js        # Salience scoring + churn scan (5th origin:
+│   │                      # churn_pattern) + getTopSalient/salienceDistribution
+│   ├── clone.js           # Digital twin — user snapshot for simulation
+│   ├── evolution.js       # Clone population evolution
+│   ├── signals.js         # Implicit signal detection
+│   ├── arc.js             # Narrative arc reranking (10 slots)
+│   ├── decay.js           # Exponential decay (14-day half-life)
+│   ├── embeddings.js      # Local ONNX embeddings (384-dim)
+│   └── types.js           # Type definitions, weights
 │
 ├── web/                 # Web reader + signal tracker + dashboard
 │   ├── reader.js        # Story page (tracks dwell, scroll, clicks)

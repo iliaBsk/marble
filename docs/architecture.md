@@ -193,7 +193,126 @@ User reacts to item
 - Long-term preference learning
 - Model stability maintenance
 
+### 7. Salience Engine (`salience.js`)
+**Responsibility**: Top-K filtering and churn detection — the primitive that replaces unbounded "scan everything" passes
+
+```javascript
+// Public API, also exposed on KnowledgeGraph
+import {
+  computeSalience,           // score a single node
+  computeVolatility,          // Map<slotKey, {score, invalidations, records}>
+  getTopSalient,              // ranked list across types
+  salienceDistribution,       // diagnostic: counts, percentiles, stale-active
+  runChurnScan,               // deterministic → churn_pattern syntheses
+} from 'marble/core/salience.js';
+```
+
+**Formula:**
+
+```
+salience = 0.6 × effective_strength + 0.2 × evidence_norm + 0.2 × slot_volatility
+```
+
+- **`effective_strength`** — `strength × 2^(-age_days / halfLife)`, halved when `valid_to=null` + `evidence_count=1` + age > 180d (stale-active guardrail prevents old one-off facts from dominating)
+- **`evidence_norm`** — `log(1 + evidence_count) / log(10)` — 10× reinforcement normalizes to ~1.0
+- **`slot_volatility`** — invalidations on this slot in trailing 180d, normalized to 0-1; high volatility is itself a signal (e.g. "serial project pivoter")
+
+`getTopSalient({ types, limit, domains })` is the input source for any pairwise / quadratic inference pass. Working with this instead of raw `getMemoryNodesSummary()` keeps the pass bounded regardless of KG size — a 5000-node KG that previously OOM'd now runs in 62ms.
+
+The churn scan (`runChurnScan`) emits **`origin: "churn_pattern"`** syntheses for slots reassigned ≥3 times in 180d. Deterministic, no LLM. Captures traits that live in the time series (e.g. "user serial-pivots projects") — invisible to snapshot-based inference.
+
+### 8. Trait Synthesis (`trait-synthesis.js`)
+**Responsibility**: LLM-directed cross-L1 pattern discovery — replaces the old O(N²) pairwise generators
+
+```javascript
+import { runTraitSynthesis } from 'marble/core/trait-synthesis.js';
+const syntheses = await runTraitSynthesis(kg, { llmClient, ...opts });
+```
+
+Four phases, run in sequence:
+
+```
+Phase 1  Per-node trait extraction (LLM, chunks of ~10 nodes)
+           each fact → 1-3 traits { dimension, value, weight, confidence, evidence_quote, domain }
+
+Phase 2  Replication grouping (in-process, no LLM)
+           group candidates by (dimension, value), compute replication_bonus
+           cross-domain multiplier rewards traits that span multiple life areas
+
+Phase 3  Contradiction detection (in-process, no LLM)
+           same dimension + divergent values from DISJOINT node sets → "contradiction" origin
+           first-class aspirational-vs-actual gap recording
+
+Phase 4  K-way emergent fusion (LLM, small number of domain-spread samples)
+           gestalt patterns that no single-node extraction would surface
+           LLM returns {label: null} if facts don't cohere — no inventing
+```
+
+Output syntheses carry structured fields (`trait`, `mechanics`, `reinforcing_nodes`, `contradicting_nodes`, `domains_bridged`, `confidence_components`, `affinities`, `aversions`, `predictions`). Labels are human handles; the structured fields are what downstream tools match against.
+
+### 9. Insight Swarm (`insight-swarm.js`)
+**Responsibility**: L1.5 — 7 psychological-dimension agents probe the KG for questions worth asking
+
+- Dimensions: desires, fears, motivations, frustrations, dreams, identity tensions, avoidance patterns
+- Each agent generates 3-5 probing questions grounded in specific KG data
+- Output persists to `kg.user.insights[]` and flows into `InferenceEngine.run()` as pre-built seeds (see `opts.seeds`) — avoids re-running the swarm
+
+### 10. Inference Engine (`inference-engine.js`)
+**Responsibility**: L2 — gates L1.5 passthrough candidates and runs temporal pattern detection
+
+Post-refactor (April 2026) this is a thin layer. The old `_inferFromBelief` / `_inferFromPreferenceIdentity` / `_inferFromConfidenceGaps` methods were deleted — they emitted O(N²) template-string noise that OOM'd on real-sized KGs. Cross-L1 pattern discovery lives entirely in `trait-synthesis.js` now.
+
+```javascript
+async run() {
+  // L1.5 passthrough — use caller-supplied seeds when available
+  // Temporal patterns — input capped via kg.getTopSalient({ limit: 100 })
+  // Inline gate — sub-threshold candidates never allocated
+}
+
+async runTraitSynthesis(opts)  // thin delegation into trait-synthesis.js
+```
+
 ## Data Flow
+
+### 0. Reasoning Pipeline (learn → synthesize → rebuild)
+
+```
+marble.learn()
+    │
+    ├──▶ L1.5 InsightSwarm          (7 psychological lenses, committee of agents)
+    │       └──▶ kg.user.insights[]        (persistent; reused as L2 seeds)
+    │
+    ├──▶ L2 InferenceEngine.run()
+    │       ├──▶ L1.5 passthrough candidates (inline gate; no alloc below threshold)
+    │       └──▶ _inferFromTemporalPatterns (input = kg.getTopSalient({limit:100}))
+    │
+    └──▶ L3 Clone evolution          (kill bottom 20%, mutate survivors)
+
+marble.synthesize()          [LLM-heavy; daily/weekly]
+    │
+    └──▶ runTraitSynthesis()         (4 phases)
+          ├──▶ Phase 1: per-node trait extraction
+          ├──▶ Phase 2: replication grouping → trait_replication / single_node
+          ├──▶ Phase 3: contradiction detection → contradiction
+          └──▶ Phase 4: K-way fusion → emergent_fusion
+               │
+               └──▶ kg.user.syntheses[] via kg.addSynthesis() (upsert)
+
+marble.rebuild()             [deterministic; safe to run per-learn or on cron]
+    │
+    ├──▶ runChurnScan()               → churn_pattern origin → kg.addSynthesis()
+    └──▶ salienceDistribution()       → diagnostic { total, staleActive, percentiles, ... }
+```
+
+**5 synthesis origins** — downstream tools can filter on any of them:
+
+| Origin | Source | Example |
+|---|---|---|
+| `single_node` | trait implied by exactly one node | "Isolated signal — risk profile: high volatility tolerant" |
+| `trait_replication` | same trait implied by multiple nodes across domains | "Replicated across 3 domains — time orientation: compound" |
+| `contradiction` | same dimension, divergent values from disjoint node sets | "Conflicting signals on follow_through: sustained ↔ inconsistent" |
+| `emergent_fusion` | gestalt pattern from K-way sample | "Endurance-engineered founder practice" |
+| `churn_pattern` | slot reassigned ≥3 times in 180d | "Churn on belief current_project" — "serial_pivoter" |
 
 ### 1. Story Ingestion
 ```
