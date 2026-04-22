@@ -109,6 +109,47 @@ Every cycle (daily by default):
 
 After ~2 weeks, surviving clones have converged on the user's actual preferences — including latent interests they never explicitly stated.
 
+### Step 9: Trait Synthesis (Optional, LLM-heavy)
+
+`marble.synthesize()` derives **structured traits** from the KG — not just "what topics does the user like" but "what psychological/behavioral dimensions replicate across their life." It runs in four phases:
+
+**Phase 1 — Per-node trait extraction.** Each L1 fact ("runs 6×/week on Higdon program") gets 1-3 traits extracted: `{ dimension: "time_orientation", value: "compound", weight: 0.75, evidence_quote: "long runs" }`. Uses the LLM in small batches (~10 nodes per call).
+
+**Phase 2 — Replication grouping.** The same trait showing up independently from several nodes is much stronger evidence than one node. Cross-domain replication (running + prayer + long stock holds → `time_orientation: compound` across health + spirituality + finance) gets a multiplier.
+
+**Phase 3 — Contradiction detection.** Same dimension with divergent values from **disjoint** node sets surfaces as a first-class `origin: "contradiction"` record — the aspirational-vs-actual gap. Example: "follow_through" implies `sustained` from daily practices but `inconsistent` from job-hop history. Both sides get recorded with full provenance.
+
+**Phase 4 — K-way emergent fusion.** A small number of domain-spread samples asking the LLM "find a gestalt pattern across these K facts, or return null if they don't cohere." Captures patterns no single-node extraction would surface ("endurance-engineered founder practice").
+
+Every synthesis decomposes into structured fields downstream tools consume as predicates — not prose labels:
+
+- `trait: { dimension, value, weight }` — the matchable unit
+- `mechanics` — why this pattern coheres (shown to users as "why we recommended this")
+- `reinforcing_nodes` / `contradicting_nodes` — full provenance, both sides
+- `confidence_components` — `base_from_llm` / `replication_bonus` / `contradiction_penalty` / `cross_domain`
+- `affinities` / `aversions` — specific enough to match real content titles
+- `predictions` — falsifiable (observable dwell / share / skip)
+
+### Step 10: Rebuild (Optional, Deterministic)
+
+`marble.rebuild()` runs two cheap deterministic passes — no LLM:
+
+1. **Churn scan.** Slots (e.g. `belief:current_project`) reassigned ≥3 times in 180d emit `origin: "churn_pattern"` syntheses. This is what captures "serial pivoter" traits — patterns that live in the TIME SERIES of invalidations, not the current snapshot. Event-driven inference never sees this; `rebuild()` does.
+
+2. **Salience distribution diagnostic.** Returns percentiles, stale-active counts, and top-10 examples so you can quickly answer "is this KG mostly signal or mostly ingestion noise?" Use `distribution.staleActive / distribution.total` as the triage ratio.
+
+## Synthesis Origins (the 5 kinds of pattern)
+
+Every synthesis has one of five `origin` values — downstream can filter by origin to, e.g., surface aspirational-vs-actual gaps separately from coherent traits:
+
+| Origin | Where it comes from | What it means |
+|---|---|---|
+| `single_node` | One fact implies a trait (Phase 1 only) | Low-confidence isolated signal — moderate weight, flagged `isolated: true` |
+| `trait_replication` | Same trait from ≥2 nodes, optionally cross-domain | High confidence. The "endurance discipline across health + work + finance" case |
+| `contradiction` | Same dimension, divergent values from disjoint nodes | The aspirational-vs-actual gap. Highest-leverage signal for content systems |
+| `emergent_fusion` | K-way LLM gestalt pattern | The "no single fact reveals this" case. Carries a full `mechanics` explanation |
+| `churn_pattern` | Slot reassigned ≥3 times in 180d | "Serial pivoter" trait. Lives in the time series, not the snapshot. Emitted by `rebuild()` |
+
 ## The Pipeline (Visual)
 
 ```
@@ -140,8 +181,22 @@ After ~2 weeks, surviving clones have converged on the user's actual preferences
 │  Telegram | Email | JSON API | Webhook | Video           │
 ├─────────────────────────────────────────────────────────┤
 │  5. LEARN                                                │
-│  World signals + platform signals + web reader signals   │
-│  → Clone evolution: surviving variants improve daily     │
+│  L1.5 InsightSwarm (7 psychological lenses, persistent)  │
+│  → L2 InferenceEngine (L1.5 passthrough + temporal)      │
+│  → L3 Clone evolution (kill bottom 20%, mutate survivors)│
+├─────────────────────────────────────────────────────────┤
+│  6. SYNTHESIZE (optional, LLM-heavy)                     │
+│  Phase 1: Per-node trait extraction                      │
+│  Phase 2: Replication grouping (cross-domain bonus)      │
+│  Phase 3: Contradiction detection (disjoint node sets)   │
+│  Phase 4: K-way emergent fusion                          │
+│  → kg.user.syntheses[] (4 origins: single_node,          │
+│    trait_replication, contradiction, emergent_fusion)    │
+├─────────────────────────────────────────────────────────┤
+│  7. REBUILD (optional, deterministic)                    │
+│  Churn scan: slot reassigned ≥3× in 180d                 │
+│  → churn_pattern origin (5th origin)                     │
+│  + salienceDistribution() diagnostic                     │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -158,3 +213,9 @@ After ~2 weeks, surviving clones have converged on the user's actual preferences
 | Convergence time | ~2 weeks |
 | Cost per simulation (with LLM) | $0.12-$0.20 |
 | Cost without LLM | $0 (local embeddings) |
+| Salience formula | `0.6 × effective_strength + 0.2 × evidence_norm + 0.2 × slot_volatility` |
+| Stale-active guardrail | `valid_to=null` + `evidence_count=1` + age > 180d → effective strength × 0.5 |
+| Volatility window | 180 days (slot invalidations) |
+| Churn threshold | ≥3 invalidations in window → `churn_pattern` synthesis |
+| Synthesis fusion samples | 5 K-way samples per `synthesize()` run (K ≈ 10 nodes) |
+| L1.5 → L2 seed reuse | `learn()` passes insights into `InferenceEngine` as `opts.seeds` — no duplicate LLM call |

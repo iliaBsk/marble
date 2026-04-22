@@ -259,6 +259,121 @@ console.log('Prediction accuracy:', report.kpis.prediction_accuracy);
 // { count: 45, average: 0.72, trend: 'improving', status: 'ok' }
 ```
 
+## 13. L2 Trait Synthesis — Structured Traits with Provenance
+
+`marble.synthesize()` runs after `learn()` to extract structured psychological/behavioral traits from the KG. Downstream tools reason over `trait` / `affinities` / `aversions` as predicates, not prose labels.
+
+```javascript
+import { Marble } from 'marble';
+
+const marble = new Marble({
+  storage: `./data/${userId}-kg.json`,
+  llm: async (prompt) => callYourLLM(prompt),
+});
+await marble.init();
+
+// Standard pipeline first
+await marble.learn();
+
+// Then L2 trait synthesis — derives traits from existing L1 + L1.5 state
+const syntheses = await marble.synthesize();
+
+// Five origin types — filter by what you care about
+const replicated    = marble.kg.getSyntheses({ origin: 'trait_replication', minConfidence: 0.7 });
+const contradictions = marble.kg.getSyntheses({ origin: 'contradiction' });
+const fusions        = marble.kg.getSyntheses({ origin: 'emergent_fusion' });
+
+for (const s of replicated) {
+  console.log(`[${s.trait.dimension}=${s.trait.value}] (${s.confidence}) — ${s.label}`);
+  console.log(`  Mechanics: ${s.mechanics}`);
+  console.log(`  Reinforced by: ${s.reinforcing_nodes.join(', ')}`);
+  console.log(`  Affinities: ${s.affinities.slice(0, 3).join(' / ')}`);
+}
+
+// Contradictions are the aspirational-vs-actual gap — often the highest-leverage signal
+for (const c of contradictions) {
+  console.log(`GAP — ${c.label}`);
+  console.log(`  Reinforcing: ${c.reinforcing_nodes.join(', ')}`);
+  console.log(`  Contradicting: ${c.contradicting_nodes.join(', ')}`);
+}
+```
+
+### Matching content against syntheses
+
+Downstream tools (e.g. a content recommender) score items by matching item features against the structured predicates — `label` never enters the scoring:
+
+```javascript
+function scoreAgainstSyntheses(item, kg) {
+  let score = 0;
+  for (const syn of kg.getSyntheses({ minConfidence: 0.6 })) {
+    const posMatch = syn.affinities.some(a => matchesFeature(item, a));
+    const negMatch = syn.aversions.some(a => matchesFeature(item, a));
+    if (posMatch) score += syn.trait.weight * syn.confidence;
+    if (negMatch) score -= syn.trait.weight * syn.confidence;
+  }
+  return score;
+}
+```
+
+## 14. Churn Patterns and Salience Diagnostic — `marble.rebuild()`
+
+`marble.rebuild()` is cheap and deterministic — no LLM calls. It captures patterns that live in the time series of belief invalidations (e.g. "user serial-pivots projects") and returns a salience-distribution diagnostic so you can tell how much of the KG is signal vs. ingestion noise.
+
+```javascript
+const { churnSyntheses, distribution } = await marble.rebuild();
+
+// Churn patterns: slots reassigned ≥3 times in 180d → origin: 'churn_pattern'
+for (const c of churnSyntheses) {
+  console.log(`${c.label} (confidence ${c.confidence})`);
+  console.log(`  ${c.mechanics}`);
+  // "The belief slot current_project has been reassigned 4 times in the past 180 days..."
+}
+
+// Salience distribution — triage the KG
+console.log(`Total active nodes: ${distribution.total}`);
+console.log(`Stale-active (likely noise): ${distribution.staleActive}`);
+console.log(`Noise ratio: ${(distribution.staleActive / distribution.total * 100).toFixed(0)}%`);
+console.log(`Salience percentiles:`, distribution.percentiles);
+console.log(`\nTop 10 most salient:`);
+distribution.topExamples.forEach(n => {
+  console.log(`  ${n.ref}: salience=${n.salience} (eff_strength=${n.effective_strength}, vol=${n.slot_volatility})`);
+});
+```
+
+### Using `kg.getTopSalient()` directly
+
+Any code that does pairwise passes over the KG should use `getTopSalient()` as the input source to stay bounded:
+
+```javascript
+// Bounded input — safe on a 5000-node KG
+const topBeliefs = marble.kg.getTopSalient({ types: ['belief'], limit: 100 });
+
+// Domain-scoped pass
+const healthAndWork = marble.kg.getTopSalient({
+  domains: ['health', 'work'],
+  limit: 50,
+});
+
+for (const { node, salience, stale_active } of topBeliefs) {
+  if (stale_active) continue;  // skip likely-noise entries
+  // ...do work over the salient subset...
+}
+```
+
+### Running both on a schedule
+
+```javascript
+// Typical cadence: learn() per-reaction or every N reactions;
+// synthesize() daily or weekly; rebuild() on every learn() or on a cron.
+async function dailyJob(marble) {
+  await marble.learn();
+  await marble.rebuild();         // cheap, always safe
+  if (isWeeklyDay()) {
+    await marble.synthesize();    // LLM-heavy, schedule accordingly
+  }
+}
+```
+
 ---
 
 ## End-to-End Startup Integration
