@@ -100,6 +100,59 @@ Persist KG state to disk.
 await marble.save();
 ```
 
+### `marble.synthesize(opts) → Synthesis[]`
+
+Run **L2 trait synthesis**. Derives structured psychological/behavioral traits from individual facts, then checks across the full KG whether each trait **replicates** across domains (confidence up), gets **contradicted** (surface as first-class gap), or only appears in a **K-way emergent fusion**. Persists results to `kg.user.syntheses[]` and returns the stored records.
+
+Designed to run after `learn()` + `investigate()` so the full multi-layer KG is available as raw material.
+
+**Options** (all optional — see `core/trait-synthesis.js` for full list):
+
+| Option | Default | Purpose |
+|---|---|---|
+| `perNodeExtraction` | `true` | Phase 1 per-node trait extraction |
+| `extractionChunkSize` | `10` | Nodes per LLM call in Phase 1 |
+| `fusionSamples` | `5` | Number of K-way emergent-fusion samples |
+| `k` | `10` | Nodes per fusion sample |
+| `contradictionScan` | `true` | Phase 3 contradiction detection |
+| `domainSpread` | `true` | Enforce domain diversity in fusion samples |
+| `strengthRange` | `[0.4, 0.9]` | Skip obvious + near-dead nodes |
+| `alpha` | `0.15` | Replication-bonus coefficient |
+| `beta` | `1.3` | Cross-domain multiplier |
+| `gamma` | `0.2` | Contradiction-penalty coefficient |
+| `requireSurprising` | `false` | Drop syntheses not flagged surprising |
+| `minConfidence` | `0.4` | Drop below threshold |
+| `schemaStrict` | `true` | Drop on any required field missing |
+
+```javascript
+const syntheses = await marble.synthesize();
+// [{ origin: 'trait_replication', trait: { dimension, value, weight }, confidence, ... }, ...]
+
+// Filter by origin after the run
+const contradictions = marble.kg.getSyntheses({ origin: 'contradiction' });
+```
+
+### `marble.rebuild() → { churnSyntheses, distribution }`
+
+Cheap deterministic pass — no LLM calls. Runs the **churn scan** (slots reassigned ≥3 times in 180d emit `origin: "churn_pattern"` syntheses) and returns the **salience distribution** (counts, percentiles, stale-active counts, top-10 examples) for triage.
+
+Safe to run on every `learn()` or on a cron. The churn scan captures "serial pivoter"-style traits that live in the time series of belief invalidations, not the current snapshot.
+
+```javascript
+const { churnSyntheses, distribution } = await marble.rebuild();
+
+console.log(distribution);
+// {
+//   total: 4509,
+//   staleActive: 2837,     // one-off facts older than 180d — likely ingestion noise
+//   percentiles: { p10, p50, p90, p99, max },
+//   byType: { belief: {...}, preference: {...}, identity: {...} },
+//   topExamples: [{ ref: 'belief:running', salience: 0.82, ... }, ...]
+// }
+```
+
+Use `distribution.staleActive / distribution.total` as a quick "is this KG mostly signal or mostly ingestion noise?" check. A high ratio (>50%) suggests an ingest-dedup follow-up is warranted.
+
 ---
 
 ## Profile Creation
@@ -200,7 +253,7 @@ const result = swarm.score(story, context);
 // }
 ```
 
-**Agent weights:**
+**Default lens set (6 agents):**
 
 | Agent | Weight | Lens |
 |-------|--------|------|
@@ -209,6 +262,24 @@ const result = swarm.score(story, context);
 | Serendipity | 0.20 | Delightful, inspiring, unexpected connections |
 | Growth | 0.15 | Adjacent interests, emerging fields |
 | Contrarian | 0.15 | Under-covered, challenges assumptions |
+| Social Proof | 0.10 | Community validation, popularity among similar users |
+
+**Injecting a custom lens set:**
+
+```javascript
+const swarm = new Swarm(kg, {
+  mode: 'deep',
+  llm: yourLLM,
+  lenses: [
+    { name: 'Domain Expert', mandate: '...', weight: 0.4 },
+    { name: 'Skeptic',       mandate: '...', weight: 0.3 },
+    { name: 'Novice',        mandate: '...', weight: 0.3 },
+  ],
+});
+const ranked = await swarm.curate(stories);
+```
+
+Each lens must be `{ name, mandate, weight }`. When `lenses` is omitted, the default 6-agent fleet above is used. For programmatic per-story scoring with dynamic agents (a different paradigm), see `generateAgentFleet()` / `swarmScore()` — those produce scoring functions, not narrative picks.
 
 ### `swarm.rank(stories, options) → RankedStory[]`
 
@@ -458,6 +529,98 @@ Returns source credibility score (0–1). Defaults to 0.5 for unknown sources.
 
 Check if user has already seen a story.
 
+### `kg.getTopSalient(opts) → Annotated[]`
+
+Return the top-K most salient nodes across the requested L1 types. **Use this instead of unbounded accessors as the input to any pairwise or quadratic inference pass** — guarantees the pass runs in bounded memory regardless of KG size.
+
+Salience folds `effective_strength` (strength × recency decay) with `evidence_norm` and `slot_volatility`, applies the stale-active guardrail, and returns a ranked list.
+
+**Formula:**
+
+```
+salience = 0.6 × effective_strength + 0.2 × evidence_norm + 0.2 × slot_volatility
+```
+
+- `effective_strength` — `strength × 2^(-age_days / halfLife)`, halved when `valid_to=null` + `evidence_count=1` + age > 180d (stale-active guardrail)
+- `evidence_norm` — `log(1 + evidence_count) / log(10)`, so 10× reinforcement ≈ 1.0
+- `slot_volatility` — invalidations on this slot in the last 180d, normalized to 0-1
+
+**Options:**
+
+| Option | Default | Purpose |
+|---|---|---|
+| `types` | `['belief', 'preference', 'identity']` | Which L1 types to rank |
+| `limit` | `100` | Top-K cutoff |
+| `domains` | — | Keep only nodes whose stored `domain` matches |
+| `asOf` | — | ISO date for as-of queries |
+
+```javascript
+const top = kg.getTopSalient({ types: ['belief'], limit: 50 });
+// [
+//   {
+//     node: { topic: 'running', claim: '...', strength: 0.85, ... },
+//     type: 'belief',
+//     ref: 'belief:running',
+//     salience: 0.82,
+//     effective_strength: 0.75,
+//     slot_volatility: 0.0,
+//     stale_active: false
+//   },
+//   ...
+// ]
+```
+
+### `kg.salienceDistribution(opts) → Distribution`
+
+Diagnostic. Returns counts, percentiles, stale-active counts, byType breakdown, and the top-10 most salient nodes. Pure function, no side effects.
+
+```javascript
+const d = kg.salienceDistribution();
+// {
+//   total: 4509,
+//   staleActive: 2837,
+//   percentiles: { p10, p50, p90, p99, max },
+//   byType: { belief: { count, staleActive }, preference: {...}, identity: {...} },
+//   topExamples: [{ ref, salience, effective_strength, slot_volatility, stale_active }, ...]
+// }
+```
+
+### `kg.addSynthesis(synthesis) → Synthesis`
+
+Persist a synthesis record. Generates an `id` + `generated_at` if missing. **Upserts on `(origin, trait.dimension, trait.value)`** — a re-run of `synthesize()` doesn't duplicate the same pattern; the higher-confidence record wins while keeping the original id.
+
+### `kg.getSyntheses(opts) → Synthesis[]`
+
+Filter syntheses with any combination of these:
+
+| Option | Type | Purpose |
+|---|---|---|
+| `minConfidence` | number | Drop below threshold |
+| `origin` | string | `'single_node'` / `'trait_replication'` / `'contradiction'` / `'emergent_fusion'` / `'churn_pattern'` |
+| `surprising` | boolean | Only records flagged surprising |
+| `trait` | `{ dimension, value }` | Both optional — match on whichever provided |
+| `domainsIncludes` | string[] | Keep records whose `domains_bridged` covers ALL given domains |
+
+```javascript
+// Aspirational-vs-actual gaps — the most valuable signal for content systems
+const gaps = kg.getSyntheses({ origin: 'contradiction' });
+
+// High-confidence cross-domain traits
+const strong = kg.getSyntheses({ minConfidence: 0.7, origin: 'trait_replication' });
+
+// Serial-pivoter patterns
+const churn = kg.getSyntheses({ origin: 'churn_pattern' });
+```
+
+### `kg.getSynthesesForNode(nodeRef) → Synthesis[]`
+
+Return records where the node appears in **either** `reinforcing_nodes` or `contradicting_nodes`. Useful for "what patterns does this fact support or undermine?" queries.
+
+```javascript
+// What does "user runs 6x/week" imply across the KG?
+const patterns = kg.getSynthesesForNode('belief:running');
+```
+
 ---
 
 ## HTTP Endpoints
@@ -657,6 +820,53 @@ Check all KPIs against targets, return any violations.
   published_at: '2026-03-25T10:00:00Z',
   valence: 0.8,        // optional: positive/negative sentiment
   actionability: 0.7   // optional: pre-computed actionability
+}
+```
+
+### Synthesis (from `marble.synthesize()` / `kg.user.syntheses[]`)
+
+Output of L2 trait synthesis — structured enough that downstream tools can reason over `trait` / `affinities` / `aversions` as predicates, not free-form prose.
+
+```javascript
+{
+  id: 'synth_1729..._abc123',
+  label: 'Replicated across 3 domains — time orientation: compound',  // HUMAN handle, not the payload
+  origin: 'trait_replication',  // 'single_node' | 'trait_replication' | 'contradiction' | 'emergent_fusion' | 'churn_pattern'
+
+  // The trait itself — matchable unit for downstream predicate matching
+  trait: {
+    dimension: 'time_orientation',
+    value: 'compound',
+    weight: 0.85
+  },
+
+  // Why this pattern coheres — shown to users as the "why we recommended this"
+  mechanics: 'Marathon training, a 3-yr daily prayer practice, 5-yr company horizons, and 5+ yr stock positions all independently imply comfort with long feedback cycles and unglamorous repetition.',
+
+  // Full provenance — every synthesis traces back to its source facts
+  reinforcing_nodes:    ['belief:running', 'identity:daily_prayer', 'context:5yr_ventures', 'preference:long_holds'],
+  contradicting_nodes: [],  // contradiction case only — facts that undermine the trait
+  domains_bridged:     ['health', 'spirituality', 'work', 'finance'],
+  isolated:             false,
+
+  // Confidence decomposed so downstream can requery at different thresholds
+  confidence: 0.88,
+  confidence_components: {
+    base_from_llm:         0.65,
+    replication_bonus:     0.25,
+    contradiction_penalty: 0.0,
+    cross_domain:          true
+  },
+
+  // What downstream SHOULD surface + MUST deprioritize
+  affinities:  ['long-form essays on compound practice', 'marathon psychology × stoicism crossovers', ...],
+  aversions:   ['hustle porn / 4am grind content', 'viral-in-90-days narratives', ...],
+  predictions: ['Will dwell >2× average on content framing work as endurance sport', ...],  // falsifiable, feedback-loop input
+
+  surprising:  false,   // LLM-flagged; useful for ranking
+  generated_at: '2026-04-22T...',
+  model:        'claude-opus-4-6',
+  mode:         'trait_synthesis'   // or 'fusion' | 'churn_scan'
 }
 ```
 

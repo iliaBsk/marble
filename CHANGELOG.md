@@ -7,6 +7,189 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — L2 trait synthesis, salience-based inference, churn patterns
+
+- **`Marble.synthesize(opts)`** — new public method that runs L2 trait synthesis
+  end-to-end: per-node trait extraction, cross-domain replication grouping,
+  contradiction detection, and a small K-way emergent-fusion pass. Results
+  persist to `kg.user.syntheses[]`. Designed to run after `learn()` +
+  `investigate()` so it has the full multi-layer KG to work with.
+
+- **`Marble.rebuild()`** — cheap deterministic pass: runs the churn scan
+  (slots reassigned ≥3 times in 180d emit `origin: "churn_pattern"`
+  syntheses), persists results, returns a salience-distribution diagnostic
+  useful for "is this KG signal or ingestion noise?" triage.
+
+- **Five synthesis origin types** now surface in `kg.user.syntheses`:
+  `single_node`, `trait_replication`, `contradiction`, `emergent_fusion`,
+  `churn_pattern`. Each synthesis decomposes into structured fields
+  downstream tools consume as predicates — `trait {dimension, value, weight}`,
+  `mechanics`, `reinforcing_nodes`, `contradicting_nodes`, `domains_bridged`,
+  `confidence_components`, `affinities`, `aversions`, `predictions`,
+  `surprising`. Labels are human handles; the structured fields are the
+  payload.
+
+- **Salience as a first-class KG primitive** (`core/salience.js`). Formula:
+  `0.6 × effective_strength + 0.2 × evidence_norm + 0.2 × slot_volatility`,
+  with a stale-active guardrail that halves effective strength for facts
+  with `valid_to=null` but `evidence_count=1` AND age > 180d. Prevents old
+  one-off beliefs ("user builds X") from dominating top-salient a year
+  after the user moved on.
+
+- **New `KnowledgeGraph` methods:**
+  - `kg.getTopSalient({ types, limit, domains, asOf })` — top-K ranked
+    input source for any pairwise/quadratic pass. Returns annotated nodes
+    with salience / effective_strength / slot_volatility / stale_active.
+  - `kg.salienceDistribution()` — counts, percentiles, stale-active counts,
+    top-10 examples. Diagnostic, no side effects.
+  - `kg.addSynthesis()` — upserts on `(origin, trait.dim, trait.val)`.
+    Lower-confidence writes do not overwrite existing records.
+  - `kg.getSyntheses({ origin, minConfidence, surprising, trait, domainsIncludes })` —
+    filter with any combination.
+  - `kg.getSynthesesForNode(nodeRef)` — returns records where the node
+    appears in either `reinforcing_nodes` or `contradicting_nodes`.
+
+- **`kg.user.insights[]` is now a persistent slot.** Previously `learn()`
+  generated L1.5 insights but dropped them on the floor. They now land in
+  the KG and L2 reuses them as seeds (see "Fixed" below).
+
+- **`InferenceEngine` accepts `opts.seeds`** — skips re-running the L1.5
+  swarm when the caller (e.g. `learn()`) has already computed insights.
+  Eliminates a duplicate LLM pass and a second failure surface.
+
+### Changed — InferenceEngine refactor (fixes OOM on real-sized KGs)
+
+- **Deleted** `_inferFromBelief`, `_inferFromPreferenceIdentity`, and
+  `_inferFromConfidenceGaps` from `InferenceEngine`. On a real KG (thousands
+  of beliefs/prefs/identities) these allocated ~10M-15M template-string
+  candidates before the filter ran, OOM'ing Node with a ~25-50GB peak heap.
+  The output was also pure template noise — no semantic content downstream
+  could use. Cross-L1 pattern discovery now lives entirely in
+  `runTraitSynthesis()`, which is LLM-directed and bounded.
+- **Kept** `_inferFromTemporalPatterns` — genuinely linear and produces
+  unique signal (stale-belief detection, evolving-preference detection).
+  Now reads from `kg.getTopSalient({ limit: 100 })` instead of unbounded
+  `getMemoryNodesSummary()`.
+- **Inline gate in `InferenceEngine.run()`**: sub-threshold candidates are
+  no longer allocated in the first place, only to be filtered at the end.
+
+### Fixed
+
+- **L1.5 insights were not persisted**: `learn()` generated them via
+  `runInsightSwarm()` but never wrote them to `kg.user.insights`, so
+  consumers that read the slot (e.g. `insight-engine.js`,
+  `hypothesis-tester.js`) got nothing. Fixed by writing after the swarm
+  runs.
+- **`InferenceEngine` re-invoked the L1.5 swarm** via `getL2Seeds()` even
+  though `learn()` had just run it 10 lines earlier. Root cause of the
+  "InsightSwarm ran fine but InferenceEngine still fails" class of errors —
+  the duplicate call would trip on transient provider failures. Fixed by
+  threading `seeds` through from `learn()` into the engine.
+- **Silent data loss on L1.5 seeds**: `inference-engine.js` read
+  `seed.implications`, but swarm output has no such field — the intended
+  source is `seed.derived_predictions`. `second_order_effects` was always
+  `[]` for L1.5-seeded candidates until this fix.
+
+### Added — API surface polish (OOTB integration pass 4)
+
+- **New `Marble#score(items, context)` public method.** Returns every scored
+  item (not sliced to `count`), sorted descending, without arc reordering.
+  Use this for AUC / MRR evaluations, external rerankers, or any case where
+  you need the full ranking distribution. `select()` is now a thin wrapper
+  around `score()` that applies the count slice and optional arc reorder.
+- **`select()` / `score()` return shape is now documented.** Previous JSDoc
+  said only "Top items, arc-ordered". The new `@returns` typedef spells out
+  the wrapper object: `story` (original item, legacy name), `item` (new
+  non-breaking alias), `relevance_score`, `magic_score`, and any
+  per-dimension components. Callers no longer have to dig into
+  `result[0].<??>` by trial and error.
+- **Non-breaking `item` alias on the result wrapper.** The wrapper field has
+  historically been called `story`, which collides with item bodies that are
+  also sometimes called `story`. Both `.story` and `.item` now point at the
+  original input item on every result, so new code can use `.item`
+  unambiguously. `.story` stays for existing downstream callers.
+
+### Improved — Scorer on topic-thin data + no-LLM mode (OOTB integration pass 3)
+
+- **`#interestMatch` no longer ties on items with empty `topics`.** When an
+  item has no tags (common for RSS without categories, text-only sources,
+  user-generated content), the scorer previously returned a flat 0.3 for every
+  such item — killing ranking differentiation. It now falls back to a pure
+  semantic match: embed the item's `title + summary`, compare to the user's
+  top interests, use the cosine similarity. Neutral 0.3 is only returned when
+  there is no text AND no embeddings AND no user interests to compare against.
+- **No-LLM mode now builds a real interest graph.** When `react()` is called
+  with an item that has no `topics` and no `TopicInsightEngine` is wired (i.e.
+  no LLM passed to the constructor), Marble now derives a small keyword set
+  from `item.title + summary` via a stopword-stripped top-N tokenizer and
+  uses them as fallback topics. Derived topics are marked `topics_derived:
+  true` on the history entry and receive a dampened interest boost (0.5×) to
+  reflect that they're heuristic, not user-curated.
+- **README now states that `learn()` is required for progressive improvement.**
+  `react()` / `feedbackBatch()` record signals, but clone evolution, the
+  inference engine, and the insight swarm only update inside `learn()`.
+  Typical integrations call it every N reactions or on a daily schedule.
+
+### Added — Provider generalization (OOTB integration pass 2)
+
+- **New `openai-compatible` LLM provider.** Any OpenAI-compatible host
+  (Moonshot/Kimi, Together, Fireworks, Groq, OpenRouter, Azure OpenAI,
+  self-hosted vLLM, etc.) is now a first-class citizen. Set
+  `LLM_PROVIDER=openai-compatible`, `LLM_BASE_URL`, `LLM_API_KEY`, and
+  `MARBLE_LLM_MODEL`. No more hijacking the `deepseek` provider to route
+  through third-party endpoints.
+- **Explicit Ollama opt-in.** The old heuristic in `_buildDeepSeekClient`
+  — "any non-DeepSeek base URL must be Ollama" — hijacked every
+  OpenAI-compatible endpoint that users pointed `DEEPSEEK_BASE_URL` at.
+  Ollama routing now requires either `DEEPSEEK_IS_OLLAMA=1` or a base URL
+  whose path looks like Ollama's native shape (`/api`, no `/v1`). Non-matching
+  URLs go through the standard OpenAI SDK path.
+- **Retry with exponential backoff on transient failures.** Both
+  `embeddings.embed()` and the OpenAI-compatible chat wrapper now retry
+  429/408/409/425/5xx responses and network errors three times (250ms, 1s,
+  4s), honoring `Retry-After` headers. 4xx client errors (400, 401, 403,
+  404, 422) are not retried. Previously a single 429 downgraded scorer
+  quality silently for the rest of the run.
+- **Dedicated embeddings env vars for split-provider setups.**
+  `OPENAI_EMBEDDINGS_API_KEY`, `OPENAI_EMBEDDINGS_BASE_URL`, and
+  `OPENAI_EMBEDDINGS_MODEL` let callers point embeddings at real OpenAI
+  while chat goes through an OpenAI-compatible proxy (or vice versa).
+  When unset, `OPENAI_API_KEY` / `OPENAI_EMBEDDING_MODEL` are used as
+  fallback so existing configs keep working unchanged.
+
+### Fixed — Install-time blockers (OOTB integration pass 1)
+
+- **`.env.example` no longer misrepresents the default embeddings provider.**
+  The old default `EMBEDDINGS_PROVIDER=local` claimed "no API key needed"
+  but was falling through to `NullEmbeddings` with a single easy-to-miss warning
+  (local ONNX embeddings were removed). Default is now `openai` with an explicit
+  `OPENAI_API_KEY` requirement, and `EMBEDDINGS_PROVIDER=none` is documented as
+  the explicit keyword-only opt-in.
+- **Louder failure when embeddings fail to initialize.** The module-level
+  singleton now emits a prominent one-time boxed warning that names the problem
+  and the fix. Integrators who request `EMBEDDINGS_PROVIDER=none` or pass their
+  own `{ embeddings: ... }` to the constructor see no warning.
+- **`KnowledgeGraph#seedClones` and `#breedStrongClones` no longer crash on
+  malformed LLM output.** Both sites used `text.match(/.../)[0]` which threw
+  `Cannot read properties of null` on empty/prose/truncated completions.
+  Replaced with a tolerant `_extractJSON(text, shape)` helper; failures now log
+  a clear warning and skip the bad response rather than aborting `learn()`.
+- **`max_tokens` raised on both clone prompts.** `seedClones` 1200 → 4096 and
+  `breedStrongClones` 600 → 4096 — the old limits routinely truncated nested
+  JSON responses. Both are now overridable via an `{ maxTokens }` option for
+  providers with lower ceilings.
+- **`embeddings` option on `new Marble()` now threads through to the Scorer.**
+  Previously the constructor accepted `embeddings` but the Scorer imported the
+  module singleton unconditionally — custom providers (for caching, retries,
+  alternative hosts) were silently ignored. Scorer constructor accepts
+  `{ embeddings }` as an option; `new Marble({ embeddings })` wires it through.
+- **Construction-time warnings de-duplicated across instances.** "No LLM
+  provider configured" and "No embeddings configured" warnings now fire at most
+  once per process, not once per `new Marble()`. Batch workloads that spin up
+  one instance per user/request/session no longer flood stderr.
+- **New `silent: true` constructor option** suppresses the above warnings
+  entirely for callers that know what they're doing.
+
 ### BREAKING CHANGES
 
 - **Package renamed**: `marblism` → `marble`

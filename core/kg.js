@@ -9,14 +9,275 @@
  * - preference: Explicit preferences and patterns
  * - identity: Role/identity attributes about the user
  * - confidence: Confidence levels in knowledge areas
+ * - episode: Source record every fact can point back to
  */
 
 import { readFile, writeFile } from 'fs/promises';
+import { createHash } from 'crypto';
 import { extractEntityAttributes } from './entity-extractor.js';
 import { embeddings as defaultEmbeddings } from './embeddings.js';
+import { getTopSalient as _getTopSalient, salienceDistribution as _salienceDistribution } from './salience.js';
+
+/**
+ * On-disk schema version. Bump when the saved JSON shape changes in a way that
+ * requires migration, and add a case to `#migrate()` below.
+ */
+export const KG_VERSION = 2;
+
+/**
+ * Default reconciliation rules — a conservative starter set that marks the
+ * most common single-value slots as cardinality "one" so that ingesting
+ * contradictory facts about them closes the older version automatically.
+ *
+ * Consumers can extend or fully replace this map via the `Marble` constructor
+ * option `reconciliationRules`. Unlisted slots retain "many" (no forced
+ * uniqueness) — a safe default that won't collapse distinct preferences.
+ */
+export const DEFAULT_RECONCILIATION_RULES = {
+  beliefs: {
+    current_city: 'one',
+    current_employer: 'one',
+    current_role: 'one',
+  },
+  preferences: {
+    primary_diet: 'one',
+    primary_language: 'one',
+    time_zone: 'one',
+  },
+  identities: {
+    current_city: 'one',
+    current_employer: 'one',
+    current_role: 'one',
+    current_school: 'one',
+  },
+};
+
+/**
+ * Default decay configuration for `getActive*` views. Half-life controls how
+ * fast `effective_strength = strength * 2^(-age_days / halfLifeDays)` shrinks
+ * as facts age. Threshold 0 preserves the pre-decay behaviour — nothing is
+ * filtered out unless consumers explicitly raise it. Historical queries
+ * (`asOf` in the past) compute age relative to that point, not today, so
+ * `getStateAt()` is unaffected.
+ */
+export const DEFAULT_DECAY_CONFIG = {
+  halfLifeDays: 365,
+  minEffectiveStrength: 0,
+};
+
+/**
+ * Default entity-resolution config. Opt-in: unless `enabled: true`, none of
+ * the resolution paths run and the KG behaves exactly as before. The threshold
+ * applies to the embedding-similarity tier; acronym and exact-match tiers are
+ * always deterministic.
+ */
+export const DEFAULT_ENTITY_RESOLUTION = {
+  enabled: false,
+  threshold: 0.85,
+};
+
+/**
+ * Walk `src` and return a version with any unclosed `{`, `[`, or `"` closed
+ * at the end. Designed to rescue LLM JSON that was truncated mid-structure
+ * by a max_tokens ceiling. Skips escapes and string literals so braces inside
+ * strings don't confuse the depth tracker. Strips a trailing comma if one
+ * dangles before the synthetic closers.
+ *
+ * This is best-effort — if the input was already structurally invalid (not
+ * just truncated), the result will still fail JSON.parse and the caller gets
+ * null. No guarantees about semantic correctness: a rescued object is at
+ * least parseable, not necessarily complete.
+ *
+ * @param {string} src
+ * @returns {string}
+ */
+function _balanceBraces(src) {
+  const stack = [];
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (escape) { escape = false; continue; }
+    if (inString) {
+      if (ch === '\\') escape = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === '{' || ch === '[') stack.push(ch);
+    else if (ch === '}' || ch === ']') stack.pop();
+  }
+  let tail = '';
+  if (inString) tail += '"';
+  // Drop a dangling comma that would otherwise appear right before the synthetic closers.
+  let trimmed = src.replace(/,\s*$/, '');
+  // Drop a half-written key-value pair at the end (e.g. `"salience":` with no value).
+  trimmed = trimmed.replace(/,?\s*"[^"]*"\s*:\s*$/, '');
+  while (stack.length) {
+    const open = stack.pop();
+    tail += open === '{' ? '}' : ']';
+  }
+  return trimmed + tail;
+}
+
+/**
+ * Tolerant JSON extraction from LLM text output.
+ *
+ * LLM completions can arrive empty, prose-wrapped, truncated mid-structure, or
+ * otherwise malformed. This helper applies three recovery layers in order:
+ *   1. Match the outermost JSON region and parse it directly.
+ *   2. If parse fails, attempt brace-balance recovery on the matched region.
+ *   3. If that fails, match the innermost opener and re-balance from there —
+ *      rescues the common "prose + truncated JSON" shape.
+ * Callers MUST still handle null.
+ *
+ * @param {string} text
+ * @param {'object'|'array'} [shape='object']
+ * @returns {any|null}
+ */
+function _extractJSON(text, shape = 'object') {
+  if (!text || typeof text !== 'string') return null;
+  const opener = shape === 'array' ? '[' : '{';
+  const re = shape === 'array' ? /\[[\s\S]*\]/ : /\{[\s\S]*\}/;
+  const m = text.match(re);
+  const candidate = m ? m[0] : null;
+  if (candidate) {
+    try { return JSON.parse(candidate); } catch { /* fall through to rescue */ }
+    try { return JSON.parse(_balanceBraces(candidate)); } catch { /* fall through */ }
+  }
+  // Last resort: start from the first opener we find and balance to EOF. This
+  // catches truncations where the closing bracket was never emitted, so the
+  // greedy regex above didn't match at all.
+  const start = text.indexOf(opener);
+  if (start >= 0) {
+    try { return JSON.parse(_balanceBraces(text.slice(start))); } catch { return null; }
+  }
+  return null;
+}
+
+/**
+ * Coerce an LLM-produced belief/preference/identity entry into the object
+ * shape the rest of the KG expects. LLMs frequently return string arrays
+ * instead of the documented object arrays; silently dropping those is worse
+ * than accepting them with sensible defaults.
+ *
+ * @param {any} entry
+ * @param {'belief'|'preference'|'identity'} kind
+ * @returns {Object|null}
+ */
+function _normalizeKgOverrideEntry(entry, kind) {
+  if (entry == null) return null;
+  if (typeof entry === 'string') {
+    const s = entry.trim();
+    if (!s) return null;
+    if (kind === 'belief') return { topic: s, value: s, confidence: 0.5 };
+    if (kind === 'preference') return { category: 'general', value: s, strength: 0.5 };
+    if (kind === 'identity') return { role: 'general', value: s, salience: 0.5 };
+  }
+  if (typeof entry !== 'object') return null;
+  // Object case: fill in any missing required fields rather than leaving
+  // downstream code to read `undefined` off the structure.
+  if (kind === 'belief') {
+    const topic = entry.topic ?? entry.name ?? entry.key ?? entry.value ?? '';
+    if (!topic) return null;
+    return {
+      ...entry,
+      topic,
+      value: entry.value ?? entry.claim ?? topic,
+      confidence: typeof entry.confidence === 'number' ? entry.confidence : 0.5,
+    };
+  }
+  if (kind === 'preference') {
+    const value = entry.value ?? entry.preference ?? entry.name ?? '';
+    if (!value && !entry.category) return null;
+    return {
+      ...entry,
+      category: entry.category ?? 'general',
+      value: value || entry.category,
+      strength: typeof entry.strength === 'number' ? entry.strength : 0.5,
+    };
+  }
+  if (kind === 'identity') {
+    const value = entry.value ?? entry.identity ?? entry.name ?? '';
+    if (!value && !entry.role) return null;
+    return {
+      ...entry,
+      role: entry.role ?? 'general',
+      value: value || entry.role,
+      salience: typeof entry.salience === 'number' ? entry.salience : 0.5,
+    };
+  }
+  return null;
+}
+
+/**
+ * Normalize an entire `kgOverrides` block. Accepts missing keys, string-shaped
+ * entries, and arrays-of-objects with partial fields. Always returns the
+ * three-key structure so downstream code can index without existence checks.
+ *
+ * @param {any} raw
+ * @returns {{ beliefs: Object[], preferences: Object[], identities: Object[] }}
+ */
+function _normalizeKgOverrides(raw) {
+  const safe = (raw && typeof raw === 'object') ? raw : {};
+  const map = (arr, kind) =>
+    (Array.isArray(arr) ? arr : [])
+      .map(e => _normalizeKgOverrideEntry(e, kind))
+      .filter(Boolean);
+  return {
+    beliefs: map(safe.beliefs, 'belief'),
+    preferences: map(safe.preferences, 'preference'),
+    identities: map(safe.identities, 'identity'),
+  };
+}
+
+// Minimal English stopword list for the no-LLM keyword fallback. Kept tiny to
+// avoid pulling in a dependency; the goal is "better than empty", not
+// production-grade NLP.
+const _STOPWORDS = new Set([
+  'a','an','the','and','or','but','if','then','than','so','of','to','for','in',
+  'on','at','by','with','from','about','into','over','under','between','through',
+  'is','are','was','were','be','been','being','have','has','had','do','does','did',
+  'will','would','could','should','may','might','must','can','cannot','this','that',
+  'these','those','i','you','he','she','it','we','they','them','their','our','your',
+  'my','me','us','as','not','no','yes','also','just','very','really','its','it\'s',
+  'up','down','out','off','too','any','some','all','more','most','much','many',
+  'one','two','three','like','get','got','go','going','gone','see','seen','saw',
+  'make','made','take','taken','took','find','found','come','came','come','gone',
+  'new','old','now','then','here','there','where','when','what','why','how','who',
+  'which','whose','been','being','being','not','don','doesn','isn','wasn','weren',
+]);
+
+/**
+ * Lightweight keyword extractor for the no-LLM mode. Splits on non-word chars,
+ * drops short tokens and stopwords, returns up to `limit` most-frequent tokens.
+ *
+ * This is a deliberately simple fallback — when no TopicInsightEngine is wired
+ * and the caller hands `react()` an item with no `topics`, we at least derive
+ * something the scorer can use rather than leaving the KG completely topic-thin.
+ *
+ * @param {string} text
+ * @param {number} [limit=5]
+ * @returns {string[]}
+ */
+function _extractKeywordsFromText(text, limit = 5) {
+  if (!text || typeof text !== 'string') return [];
+  const freq = new Map();
+  const tokens = text.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  for (const t of tokens) {
+    if (t.length < 3) continue;
+    if (_STOPWORDS.has(t)) continue;
+    if (/^\d+$/.test(t)) continue;
+    freq.set(t, (freq.get(t) || 0) + 1);
+  }
+  return [...freq.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([k]) => k);
+}
 
 export class KnowledgeGraph {
-  constructor(dataPath) {
+  constructor(dataPath, opts = {}) {
     this.dataPath = dataPath;
     this.user = null;
     this.items = new Map();
@@ -26,6 +287,13 @@ export class KnowledgeGraph {
     // Native vector index: node_id → Float32Array embedding
     this._vectorIndex = new Map();
     this._vectorIndexMeta = new Map();   // node_id → { type, node, text }
+    // Decay config — overridable per-instance so consumers with long-lived
+    // facts (preferences that rarely change) can use a longer half-life.
+    this.decayConfig = { ...DEFAULT_DECAY_CONFIG, ...(opts.decayConfig || {}) };
+    // Entity resolution is opt-in. When disabled (default), resolveEntity()
+    // and the entity-aware codepaths below are no-ops so existing consumers
+    // see no behaviour change.
+    this.entityResolution = { ...DEFAULT_ENTITY_RESOLUTION, ...(opts.entityResolution || {}) };
   }
 
   /**
@@ -42,16 +310,39 @@ export class KnowledgeGraph {
       const data = JSON.parse(raw);
       this.user = data.user || this.#defaultUser();
       this._dimensionalPreferences = data._dimensionalPreferences || [];
+      this.version = data.version ?? 0;
+      if (this.version < KG_VERSION) this.#migrate();
       return this;
     } catch {
       this.user = this.#defaultUser();
       this._dimensionalPreferences = [];
+      this.version = KG_VERSION;
       return this;
     }
   }
 
+  /**
+   * Forward-migrate the in-memory KG from whatever `this.version` was loaded
+   * to `KG_VERSION`. Runs on every load when the on-disk file predates the
+   * current schema — migrations must be idempotent and safe to run repeatedly.
+   *
+   * Migration map:
+   *   0 → 1: add `episodes: []` to user
+   *   1 → 2: add `entities: []` to user
+   */
+  #migrate() {
+    if (this.version < 1) {
+      if (!Array.isArray(this.user.episodes)) this.user.episodes = [];
+    }
+    if (this.version < 2) {
+      if (!Array.isArray(this.user.entities)) this.user.entities = [];
+    }
+    this.version = KG_VERSION;
+  }
+
   async save() {
     const data = {
+      version: KG_VERSION,
       user: this.user,
       _dimensionalPreferences: this._dimensionalPreferences,
       updated_at: new Date().toISOString()
@@ -107,12 +398,34 @@ export class KnowledgeGraph {
    * @param {Object} [item=null] - Optional item metadata for secondary context extraction
    */
   recordReaction(itemId, reaction, topics, source, item = null) {
+    // No-LLM keyword fallback: when no TopicInsightEngine is wired and the
+    // caller provided no topics, derive a small keyword set from the item's
+    // title/summary so the interest graph gets a signal (otherwise every
+    // reaction in no-LLM mode contributes zero to the scorer's interest match).
+    // Marked derivedTopics on the history entry so downstream code can weight
+    // them lower if desired — they are a heuristic fallback, not user-curated.
+    let effectiveTopics = topics;
+    let derivedTopics = false;
+    if (
+      (!effectiveTopics || effectiveTopics.length === 0) &&
+      !this._topicInsightEngine &&
+      item
+    ) {
+      const text = `${item.title || ''} ${item.summary || item.description || ''}`.trim();
+      const kws = _extractKeywordsFromText(text);
+      if (kws.length) {
+        effectiveTopics = kws;
+        derivedTopics = true;
+      }
+    }
+
     const historyEntry = {
       item_id: itemId,
       reaction,
       date: new Date().toISOString(),
-      topics,
-      source
+      topics: effectiveTopics,
+      source,
+      ...(derivedTopics && { topics_derived: true }),
     };
 
     // Extract and store secondary context if item metadata provided
@@ -137,12 +450,15 @@ export class KnowledgeGraph {
 
     this.user.history.push(historyEntry);
 
-    // Update interest weights based on reaction
-    for (const topic of topics) {
+    // Update interest weights based on reaction. Derived-keyword topics get a
+    // dampened boost (half the normal rate) since they are heuristic, not
+    // user-declared.
+    const boostMultiplier = derivedTopics ? 0.5 : 1.0;
+    for (const topic of effectiveTopics || []) {
       if (reaction === 'up' || reaction === 'share') {
-        this.boostInterest(topic, reaction === 'share' ? 0.15 : 0.1);
+        this.boostInterest(topic, (reaction === 'share' ? 0.15 : 0.1) * boostMultiplier);
       } else if (reaction === 'down') {
-        this.decayInterest(topic, 0.05);
+        this.decayInterest(topic, 0.05 * boostMultiplier);
       }
     }
 
@@ -227,33 +543,57 @@ export class KnowledgeGraph {
    * @param {string} topic - Topic or domain
    * @param {string} claim - The belief statement
    * @param {number} strength - Belief strength (0-1)
+   * @param {Object} [opts]
+   * @param {string} [opts.validFrom] - ISO date when this belief became true in
+   *   the real world (source date). Defaults to now. Pass the source timestamp
+   *   here so temporal queries work against the source timeline, not the
+   *   ingest timeline.
+   * @param {string} [opts.episodeId] - Provenance pointer. Appended to the
+   *   fact's `evidence: [episode_id]` array so `getFactProvenance()` can trace
+   *   back to the source.
    */
-  addBelief(topic, claim, strength = 0.7) {
+  addBelief(topic, claim, strength = 0.7, opts = {}) {
     const now = new Date().toISOString();
-    const active = this.user.beliefs.find(b =>
-      b.topic.toLowerCase() === topic.toLowerCase() && !b.valid_to
-    );
+    const validFrom = opts.validFrom || now;
+    // When an entity id is attached, treat two facts with matching
+    // (topic, entity_id) as the same fact even if the raw claim string
+    // differs. This is how "school=BSB" + "school=British School Barcelona"
+    // collapse to a single active belief.
+    const matchesSame = (b) => {
+      if (b.topic.toLowerCase() !== topic.toLowerCase() || b.valid_to) return false;
+      if (opts.entityId && b.entity_id) return b.entity_id === opts.entityId;
+      return b.claim === claim;
+    };
+    const matchesSlot = (b) =>
+      b.topic.toLowerCase() === topic.toLowerCase() && !b.valid_to;
+    const active = this.user.beliefs.find(matchesSlot);
 
     if (active) {
-      if (active.claim === claim) {
+      if (matchesSame(active)) {
         // Reinforce existing belief
         active.strength = Math.min(1, strength);
         active.evidence_count = (active.evidence_count || 0) + 1;
         active.recorded_at = now;
+        if (opts.episodeId) this.#linkEvidence(active, opts.episodeId);
         return;
       }
-      // Contradiction: close old fact
-      active.valid_to = now;
+      // Contradiction: close old fact. Use the incoming validFrom (source
+      // date) so the closure lines up on the source timeline, not wall-clock.
+      active.valid_to = validFrom;
     }
 
-    this.user.beliefs.push({
+    const fact = {
       topic, claim,
       strength: Math.min(1, strength),
       evidence_count: 1,
-      valid_from: now,
+      valid_from: validFrom,
       valid_to: null,
-      recorded_at: now
-    });
+      recorded_at: now,
+      evidence: [],
+      ...(opts.entityId ? { entity_id: opts.entityId } : {}),
+    };
+    if (opts.episodeId) this.#linkEvidence(fact, opts.episodeId);
+    this.user.beliefs.push(fact);
   }
 
   /**
@@ -269,17 +609,151 @@ export class KnowledgeGraph {
   }
 
   /**
-   * Return all beliefs that are active (valid_to is null or > asOf).
-   * @param {string} [asOf] - ISO date; defaults to now
-   * @returns {Array} Active beliefs
+   * Return a trimmed, caller-friendly view of the active belief on `topic`.
+   *
+   * The full fact object (with every internal field) is available via
+   * `getBelief()`; this method is for consumers who just want to render or
+   * filter the belief without reaching into internals. Freshness uses the
+   * temporal-decay `age_days`; `confidence` uses the decayed
+   * `effective_strength`. `top_sources` resolves evidence episode ids to
+   * short refs (`{ id, source, source_date }`) so provenance can be
+   * displayed without a second lookup.
+   *
+   * @param {string} topic
+   * @param {Object} [opts]
+   * @param {string} [opts.asOf]
+   * @param {number} [opts.minConfidence] - Reject if effective_strength is below this
+   * @param {number} [opts.maxFreshnessDays] - Reject if older than this
+   * @param {number} [opts.topSources=3] - How many episode refs to include
+   * @returns {{ value: string, confidence: number, freshness_days: number, evidence_count: number, top_sources: Array<{ id, source, source_date }> }|null}
    */
-  getActiveBeliefs(asOf) {
-    const ts = asOf ? new Date(asOf).getTime() : Date.now();
-    return this.user.beliefs.filter(b => {
-      const from = b.valid_from ? new Date(b.valid_from).getTime() : 0;
-      const to = b.valid_to ? new Date(b.valid_to).getTime() : Infinity;
-      return from <= ts && ts < to;
-    });
+  getActiveBelief(topic, opts = {}) {
+    const fact = this.getActiveBeliefs(opts.asOf, opts).find(
+      b => b.topic.toLowerCase() === topic.toLowerCase()
+    );
+    return this.#viewFact(fact, 'belief', opts);
+  }
+
+  /**
+   * Singular rich-view accessor for preferences. When multiple preferences
+   * exist on the same `type` (e.g. many "favorite_music" entries), returns
+   * the one with the highest effective_strength — "give me the canonical
+   * answer for this slot". Pass `description` to target a specific one.
+   *
+   * @param {string} type
+   * @param {Object} [opts]
+   * @param {string} [opts.description] - Disambiguate when type has many entries
+   * @param {string} [opts.asOf]
+   * @param {number} [opts.minConfidence]
+   * @param {number} [opts.maxFreshnessDays]
+   * @param {number} [opts.topSources=3]
+   * @returns {{ value: string, confidence: number, freshness_days: number, evidence_count?: number, top_sources: Array }|null}
+   */
+  getActivePreference(type, opts = {}) {
+    const candidates = this.getActivePreferences(opts.asOf, opts)
+      .filter(p => p.type.toLowerCase() === type.toLowerCase());
+    if (candidates.length === 0) return null;
+    let fact;
+    if (opts.description) {
+      fact = candidates.find(p => p.description.toLowerCase() === opts.description.toLowerCase());
+    } else {
+      // Multi-entry slots (e.g. "favorite_music") — pick the strongest active
+      // entry so there's a single canonical answer to "what's their X?".
+      fact = candidates.reduce((best, p) =>
+        (p.effective_strength ?? p.strength ?? 0) > (best.effective_strength ?? best.strength ?? 0) ? p : best
+      );
+    }
+    return this.#viewFact(fact, 'preference', opts);
+  }
+
+  /**
+   * Singular rich-view accessor for identities.
+   *
+   * @param {string} role
+   * @param {Object} [opts]
+   * @param {string} [opts.asOf]
+   * @param {number} [opts.minConfidence]
+   * @param {number} [opts.maxFreshnessDays]
+   * @param {number} [opts.topSources=3]
+   * @returns {{ value: string, confidence: number, freshness_days: number, top_sources: Array }|null}
+   */
+  getActiveIdentity(role, opts = {}) {
+    const fact = this.getActiveIdentities(opts.asOf, opts).find(
+      i => i.role.toLowerCase() === role.toLowerCase()
+    );
+    return this.#viewFact(fact, 'identity', opts);
+  }
+
+  /**
+   * Shared "rich view" projection. Extracted so all three singular
+   * accessors produce the same shape and honour the same filter options.
+   * @private
+   */
+  #viewFact(fact, kind, opts = {}) {
+    if (!fact) return null;
+
+    // `effective_strength` / `age_days` are attached by `#filterActive`.
+    // If a caller bypassed the public accessors (addX → user.beliefs) the
+    // fact may not have them yet — fall back to the raw strength/salience
+    // and skip freshness rather than emitting garbage numbers.
+    const confidence = typeof fact.effective_strength === 'number'
+      ? fact.effective_strength
+      : (typeof fact.strength === 'number' ? fact.strength
+        : (typeof fact.salience === 'number' ? fact.salience : 0));
+    const freshness_days = typeof fact.age_days === 'number' ? fact.age_days : null;
+
+    const minConfidence = typeof opts.minConfidence === 'number' ? opts.minConfidence : null;
+    if (minConfidence !== null && confidence < minConfidence) return null;
+    if (
+      typeof opts.maxFreshnessDays === 'number'
+      && freshness_days !== null
+      && freshness_days > opts.maxFreshnessDays
+    ) return null;
+
+    const topN = opts.topSources ?? 3;
+    const top_sources = Array.isArray(fact.evidence)
+      ? fact.evidence.slice(0, topN)
+        .map(id => this.getEpisode(id))
+        .filter(Boolean)
+        .map(e => ({ id: e.id, source: e.source, source_date: e.source_date }))
+      : [];
+
+    // Use the right "value" field per kind.
+    const value = kind === 'belief' ? fact.claim
+      : kind === 'preference' ? fact.description
+      : fact.context;
+
+    const view = {
+      value,
+      confidence,
+      freshness_days,
+      top_sources,
+    };
+    if (typeof fact.evidence_count === 'number') view.evidence_count = fact.evidence_count;
+    return view;
+  }
+
+  /**
+   * Return all beliefs that are active (valid_to is null or > asOf).
+   *
+   * Each returned belief is a shallow copy with two extra fields computed at
+   * read time:
+   *   - `effective_strength = strength * 2^(-age_days / halfLifeDays)`
+   *   - `age_days` (relative to `asOf`)
+   *
+   * Stored facts are not mutated. When `decayConfig.minEffectiveStrength > 0`,
+   * facts whose effective strength falls below the threshold are filtered
+   * out — this is how consumers ask "ignore stale facts" without changing
+   * the underlying data. Threshold defaults to 0 so back-compat is preserved.
+   *
+   * @param {string} [asOf] - ISO date; defaults to now
+   * @param {Object} [opts]
+   * @param {number} [opts.halfLifeDays] - Override instance half-life
+   * @param {number} [opts.minEffectiveStrength] - Override instance threshold
+   * @returns {Array} Active beliefs with `effective_strength` + `age_days`
+   */
+  getActiveBeliefs(asOf, opts = {}) {
+    return this.#filterActive(this.user.beliefs, asOf, opts);
   }
 
   /**
@@ -288,29 +762,43 @@ export class KnowledgeGraph {
    * @param {string} type - Preference type (e.g., "content_style", "format", "tone")
    * @param {string} description - What the preference is
    * @param {number} strength - Preference strength (-1 to 1)
+   * @param {Object} [opts]
+   * @param {string} [opts.validFrom] - ISO date when this preference became
+   *   true (source date). Defaults to now.
+   * @param {string} [opts.episodeId] - Provenance pointer.
    */
-  addPreference(type, description, strength = 0.7) {
+  addPreference(type, description, strength = 0.7, opts = {}) {
     const now = new Date().toISOString();
-    const active = this.user.preferences.find(p =>
-      p.type.toLowerCase() === type.toLowerCase() &&
-      p.description.toLowerCase() === description.toLowerCase() &&
-      !p.valid_to
-    );
+    const validFrom = opts.validFrom || now;
+    // Entity-aware matching: two preferences with the same type that resolve
+    // to the same entity are "the same" even if their description strings
+    // differ. Without an entity id, fall back to the exact desc match that
+    // has always been here.
+    const active = this.user.preferences.find(p => {
+      if (p.type.toLowerCase() !== type.toLowerCase() || p.valid_to) return false;
+      if (opts.entityId && p.entity_id) return p.entity_id === opts.entityId;
+      return p.description.toLowerCase() === description.toLowerCase();
+    });
 
     if (active) {
       // Reinforce — update strength in place
       active.strength = Math.max(-1, Math.min(1, strength));
       active.recorded_at = now;
+      if (opts.episodeId) this.#linkEvidence(active, opts.episodeId);
       return;
     }
 
-    this.user.preferences.push({
+    const fact = {
       type, description,
       strength: Math.max(-1, Math.min(1, strength)),
-      valid_from: now,
+      valid_from: validFrom,
       valid_to: null,
-      recorded_at: now
-    });
+      recorded_at: now,
+      evidence: [],
+      ...(opts.entityId ? { entity_id: opts.entityId } : {}),
+    };
+    if (opts.episodeId) this.#linkEvidence(fact, opts.episodeId);
+    this.user.preferences.push(fact);
   }
 
   /**
@@ -327,16 +815,15 @@ export class KnowledgeGraph {
 
   /**
    * Return all preferences that are currently active.
+   * Adds `effective_strength` + `age_days` the same way `getActiveBeliefs()`
+   * does; see that method for the decay semantics.
+   *
    * @param {string} [asOf] - ISO date; defaults to now
-   * @returns {Array} Active preferences
+   * @param {Object} [opts]
+   * @returns {Array} Active preferences with computed freshness fields
    */
-  getActivePreferences(asOf) {
-    const ts = asOf ? new Date(asOf).getTime() : Date.now();
-    return this.user.preferences.filter(p => {
-      const from = p.valid_from ? new Date(p.valid_from).getTime() : 0;
-      const to = p.valid_to ? new Date(p.valid_to).getTime() : Infinity;
-      return from <= ts && ts < to;
-    });
+  getActivePreferences(asOf, opts = {}) {
+    return this.#filterActive(this.user.preferences, asOf, opts);
   }
 
   /**
@@ -345,31 +832,427 @@ export class KnowledgeGraph {
    * @param {string} role - Identity role (e.g., "engineer", "founder", "investor")
    * @param {string} context - Context for this identity
    * @param {number} salience - How central this identity is (0-1)
+   * @param {Object} [opts]
+   * @param {string} [opts.validFrom] - ISO date when this identity became
+   *   true (source date). Defaults to now.
+   * @param {string} [opts.episodeId] - Provenance pointer.
    */
-  addIdentity(role, context = '', salience = 0.8) {
+  addIdentity(role, context = '', salience = 0.8, opts = {}) {
     const now = new Date().toISOString();
+    const validFrom = opts.validFrom || now;
     const active = this.user.identities.find(i =>
       i.role.toLowerCase() === role.toLowerCase() && !i.valid_to
     );
 
+    const contextMatchesEntity = active && opts.entityId && active.entity_id === opts.entityId;
     if (active) {
-      if (active.context === context) {
-        // Reinforce
+      if (active.context === context || contextMatchesEntity) {
+        // Reinforce — either exact context match, or the entity id matches
+        // so different phrasings of the same thing count as the same fact.
         active.salience = Math.min(1, salience);
         active.recorded_at = now;
+        if (opts.episodeId) this.#linkEvidence(active, opts.episodeId);
         return;
       }
-      // Role context changed — close old
-      active.valid_to = now;
+      // Role context changed — close old, align to source timeline.
+      active.valid_to = validFrom;
     }
 
-    this.user.identities.push({
+    const fact = {
       role, context,
       salience: Math.min(1, salience),
-      valid_from: now,
+      valid_from: validFrom,
       valid_to: null,
-      recorded_at: now
-    });
+      recorded_at: now,
+      evidence: [],
+      ...(opts.entityId ? { entity_id: opts.entityId } : {}),
+    };
+    if (opts.episodeId) this.#linkEvidence(fact, opts.episodeId);
+    this.user.identities.push(fact);
+  }
+
+  // ── Episodes (first-class source records) ──────────────
+
+  /**
+   * Record (or look up) a source episode. An episode is one concrete piece of
+   * input material — a chat conversation, a journal entry, an email thread —
+   * that facts can point back to via their `evidence: [episode_id]` array.
+   *
+   * Idempotent: if an episode with a matching `id` OR matching `content_hash`
+   * already exists, the existing one is returned. This lets the miner safely
+   * re-ingest the same file without creating duplicate episodes, and lets two
+   * different consumers converge on the same record when they happen to
+   * produce the same content.
+   *
+   * @param {Object} ep
+   * @param {string} [ep.id] - Consumer-supplied ID; auto-generated if omitted.
+   * @param {string} [ep.source='unknown'] - Free-form label (e.g. "chatgpt",
+   *   "gmail", "notes"). Consumers own the namespace.
+   * @param {string} [ep.source_date] - ISO date when the episode happened in
+   *   the real world. Null if unknown — fall back explicitly rather than
+   *   silently stamping "now".
+   * @param {string} [ep.content] - Raw text; hashed and summarised, not stored
+   *   verbatim (KGs are not blob stores).
+   * @param {string} [ep.content_summary] - Optional pre-computed summary.
+   * @param {Object} [ep.metadata] - Opaque consumer-side extras.
+   * @returns {Object} The canonical episode record.
+   */
+  addEpisode(ep = {}) {
+    if (!Array.isArray(this.user.episodes)) this.user.episodes = [];
+    const content = ep.content ?? '';
+    const content_hash = ep.content_hash || (content
+      ? createHash('sha256').update(content).digest('hex').slice(0, 16)
+      : null);
+    const now = new Date().toISOString();
+
+    // Dedup: prefer explicit id, fall back to hash. Returning the existing
+    // record (not a new one) lets callers repeatedly call addEpisode() during
+    // re-ingests without bloating the KG.
+    const existing = this.user.episodes.find(e =>
+      (ep.id && e.id === ep.id) ||
+      (content_hash && e.content_hash === content_hash)
+    );
+    if (existing) return existing;
+
+    const id = ep.id || `ep_${Date.now()}_${this.user.episodes.length}`;
+    const record = {
+      id,
+      source: ep.source || 'unknown',
+      source_date: ep.source_date || null,
+      ingested_at: now,
+      content_hash,
+      content_summary: ep.content_summary || (content ? content.slice(0, 200) : null),
+      ...(ep.metadata ? { metadata: ep.metadata } : {}),
+    };
+    this.user.episodes.push(record);
+    return record;
+  }
+
+  /**
+   * Look up an episode by id.
+   * @param {string} id
+   * @returns {Object|null}
+   */
+  getEpisode(id) {
+    return (this.user.episodes || []).find(e => e.id === id) || null;
+  }
+
+  /**
+   * Return the episode records that back a given fact — the provenance trail.
+   * Accepts either a fact object directly or a `{ type, topic }` selector.
+   *
+   * @param {Object} ref - `{ evidence: [...] }` or `{ type, topic }` or `{ type, role }`
+   * @returns {Array<Object>} Episode records in the order they were linked.
+   */
+  getFactProvenance(ref) {
+    if (!ref) return [];
+    let fact = ref;
+    if (!Array.isArray(ref.evidence) && (ref.type || ref.kind)) {
+      const type = ref.type || ref.kind;
+      const key = (ref.topic || ref.role || ref.type || '').toLowerCase();
+      const collection = type === 'belief' ? this.user.beliefs
+        : type === 'preference' ? this.user.preferences
+        : type === 'identity' ? this.user.identities
+        : [];
+      fact = collection.find(f => {
+        const k = (f.topic || f.type || f.role || '').toLowerCase();
+        return k === key && !f.valid_to;
+      });
+    }
+    if (!fact || !Array.isArray(fact.evidence)) return [];
+    return fact.evidence
+      .map(id => this.getEpisode(id))
+      .filter(Boolean);
+  }
+
+  #linkEvidence(fact, episodeId) {
+    if (!Array.isArray(fact.evidence)) fact.evidence = [];
+    if (!fact.evidence.includes(episodeId)) fact.evidence.push(episodeId);
+  }
+
+  /**
+   * Shared active-fact filter with temporal decay applied at read time.
+   * Used by `getActiveBeliefs/Preferences/Identities`.
+   *
+   * Decays `strength` (or `salience` for identities) with a half-life on
+   * `valid_from → asOf`. Returns shallow copies with `effective_strength`
+   * and `age_days` appended; the stored facts are never mutated. Callers
+   * who set `minEffectiveStrength > 0` get stale facts filtered out; the
+   * default threshold of 0 preserves pre-decay behaviour.
+   *
+   * @private
+   */
+  #filterActive(collection, asOf, opts = {}) {
+    const ts = asOf ? new Date(asOf).getTime() : Date.now();
+    const halfLife = opts.halfLifeDays ?? this.decayConfig.halfLifeDays;
+    const threshold = opts.minEffectiveStrength ?? this.decayConfig.minEffectiveStrength;
+    const halfLifeMs = halfLife * 86_400_000;
+    const results = [];
+
+    for (const fact of collection) {
+      const from = fact.valid_from ? new Date(fact.valid_from).getTime() : 0;
+      const to = fact.valid_to ? new Date(fact.valid_to).getTime() : Infinity;
+      if (!(from <= ts && ts < to)) continue;
+
+      // Base score: `strength` for beliefs/preferences, `salience` for
+      // identities. Fall back to 0.5 if neither is present (defensive).
+      const baseStrength = typeof fact.strength === 'number'
+        ? fact.strength
+        : (typeof fact.salience === 'number' ? fact.salience : 0.5);
+
+      // Age measured from the fact's source date, not ingest date — so
+      // imported-old facts age correctly. Negative ages (future-dated) are
+      // clamped to 0 so the decay term never exceeds 1.
+      const ageMs = Math.max(0, ts - from);
+      const effectiveStrength = halfLifeMs > 0
+        ? baseStrength * Math.pow(0.5, ageMs / halfLifeMs)
+        : baseStrength;
+
+      if (effectiveStrength < threshold) continue;
+
+      results.push({
+        ...fact,
+        effective_strength: effectiveStrength,
+        age_days: ageMs / 86_400_000,
+      });
+    }
+    return results;
+  }
+
+  // ── Reconciliation ─────────────────────────────────────
+
+  /**
+   * Sweep active facts and enforce cardinality on slots listed as "one" in
+   * the rules. For each such slot, keep only the newest active fact; every
+   * older one gets `valid_to` set to the newer fact's `valid_from` so the
+   * timeline reads as a clean handoff, not an overlap.
+   *
+   * Idempotent — re-running changes nothing when the graph is already
+   * reconciled. Safe to call after every ingest.
+   *
+   * Rule shape:
+   *   {
+   *     beliefs:     { [topic]: 'one' | 'many' },
+   *     preferences: { [type]:  'one' | 'many' },
+   *     identities:  { [role]:  'one' | 'many' }
+   *   }
+   *
+   * Only 'one' slots are acted on. Unlisted or 'many' slots keep their
+   * existing (possibly multiple) active facts untouched.
+   *
+   * @param {Object} [rules] - Rule map; defaults to `DEFAULT_RECONCILIATION_RULES`
+   * @returns {{ beliefs_invalidated: number, preferences_invalidated: number, identities_invalidated: number }}
+   */
+  reconcile(rules = DEFAULT_RECONCILIATION_RULES) {
+    const merged = {
+      beliefs: { ...(rules?.beliefs || {}) },
+      preferences: { ...(rules?.preferences || {}) },
+      identities: { ...(rules?.identities || {}) },
+    };
+
+    const sweep = (collection, ruleMap, keyFn) => {
+      // Bucket active facts by lowercase slot key. Only enforce on slots the
+      // consumer explicitly marked 'one'. Entity ids affect equivalence at
+      // `addBelief/Preference/Identity` time (in-place reinforcement when
+      // two calls share an entity_id under the same slot); `reconcile()`
+      // stays slot-based because a 'one' slot means "exactly one active
+      // fact" regardless of which entity it refers to.
+      const buckets = new Map();
+      for (const fact of collection) {
+        if (fact.valid_to) continue;
+        const key = (keyFn(fact) || '').toLowerCase();
+        if (!key) continue;
+        const rule = ruleMap[key] || ruleMap[keyFn(fact)]; // exact-case fallback
+        if (rule !== 'one') continue;
+        if (!buckets.has(key)) buckets.set(key, []);
+        buckets.get(key).push(fact);
+      }
+
+      let invalidated = 0;
+      for (const group of buckets.values()) {
+        if (group.length < 2) continue;
+        // Sort by valid_from ascending, keep newest, close the rest at the
+        // newest's valid_from (so the timeline is a clean handoff).
+        group.sort((a, b) => {
+          const aT = a.valid_from ? new Date(a.valid_from).getTime() : 0;
+          const bT = b.valid_from ? new Date(b.valid_from).getTime() : 0;
+          return aT - bT;
+        });
+        const newest = group[group.length - 1];
+        for (const older of group.slice(0, -1)) {
+          older.valid_to = newest.valid_from || new Date().toISOString();
+          older.invalidation_reason = older.invalidation_reason || 'reconciled';
+          invalidated += 1;
+        }
+      }
+      return invalidated;
+    };
+
+    return {
+      beliefs_invalidated: sweep(this.user.beliefs, merged.beliefs, f => f.topic),
+      preferences_invalidated: sweep(this.user.preferences, merged.preferences, f => f.type),
+      identities_invalidated: sweep(this.user.identities, merged.identities, f => f.role),
+    };
+  }
+
+  // ── Entity resolution (alias clustering) ───────────────
+
+  /**
+   * Resolve a label to a canonical entity id, creating one if no match
+   * exists. Matching tiers, in order:
+   *
+   *   1. Exact match (case-insensitive, whitespace-normalised) on canonical
+   *      or any alias.
+   *   2. Acronym match: "BSB" matches "British School Barcelona" when every
+   *      letter of the shorter form is the first letter of a significant
+   *      word in the longer form (in order).
+   *   3. Embedding similarity ≥ `threshold` — only when an embeddings
+   *      provider is available and the shorter label is non-trivial
+   *      (>=3 chars). Skipped silently otherwise.
+   *
+   * The aliases list on the matched entity grows with every novel phrasing
+   * seen, so "her school" alongside existing "British School Barcelona" +
+   * "BSB" converges to a single entity with three aliases after three
+   * resolutions.
+   *
+   * Works regardless of `entityResolution.enabled` — that flag only gates
+   * whether the ingest pipeline calls this method automatically. Consumers
+   * can always call it by hand.
+   *
+   * @param {string} label
+   * @param {Object} [opts]
+   * @param {Float32Array} [opts.embedding] - Pre-computed embedding for `label`.
+   *   Reuse across many calls by passing it explicitly — skips one API call.
+   * @param {Object} [opts.embeddings] - Provider override; defaults to the
+   *   module-level singleton.
+   * @param {number} [opts.threshold] - Overrides `entityResolution.threshold`.
+   * @returns {Promise<{ id: string, canonical: string, matched_via: 'exact'|'acronym'|'embedding'|'created' }>}
+   */
+  async resolveEntity(label, opts = {}) {
+    const text = String(label || '').trim();
+    if (!text) throw new Error('resolveEntity: empty label');
+    if (!Array.isArray(this.user.entities)) this.user.entities = [];
+
+    const norm = this.#normalizeLabel(text);
+
+    // Tier 1: exact (canonical or alias, case-insensitive)
+    for (const ent of this.user.entities) {
+      if (this.#normalizeLabel(ent.canonical) === norm) {
+        return { id: ent.id, canonical: ent.canonical, matched_via: 'exact' };
+      }
+      if ((ent.aliases || []).some(a => this.#normalizeLabel(a) === norm)) {
+        return { id: ent.id, canonical: ent.canonical, matched_via: 'exact' };
+      }
+    }
+
+    // Tier 2: acronym (handles "BSB" ↔ "British School Barcelona")
+    for (const ent of this.user.entities) {
+      const candidates = [ent.canonical, ...(ent.aliases || [])];
+      for (const cand of candidates) {
+        if (this.#isAcronymMatch(text, cand) || this.#isAcronymMatch(cand, text)) {
+          // Record the novel phrasing so future exact-match calls hit.
+          if (!ent.aliases?.some(a => this.#normalizeLabel(a) === norm)) {
+            ent.aliases = [...(ent.aliases || []), text];
+          }
+          return { id: ent.id, canonical: ent.canonical, matched_via: 'acronym' };
+        }
+      }
+    }
+
+    // Tier 3: embedding similarity. Skip gracefully when no provider.
+    const threshold = opts.threshold ?? this.entityResolution.threshold;
+    const provider = opts.embeddings || defaultEmbeddings;
+    let embedding = opts.embedding;
+    if (!embedding && text.length >= 3 && provider && typeof provider.embed === 'function') {
+      try { embedding = await provider.embed(text); } catch { embedding = null; }
+    }
+    if (embedding && embedding.length > 0) {
+      let best = null;
+      let bestScore = -Infinity;
+      for (const ent of this.user.entities) {
+        if (!ent.embedding || ent.embedding.length === 0) continue;
+        const entVec = ent.embedding instanceof Float32Array
+          ? ent.embedding
+          : Float32Array.from(ent.embedding);
+        if (entVec.length !== embedding.length) continue;
+        const sim = this.#cosineSimilarity(embedding, entVec);
+        if (sim > bestScore) { best = ent; bestScore = sim; }
+      }
+      if (best && bestScore >= threshold) {
+        if (!best.aliases?.some(a => this.#normalizeLabel(a) === norm)) {
+          best.aliases = [...(best.aliases || []), text];
+        }
+        return { id: best.id, canonical: best.canonical, matched_via: 'embedding' };
+      }
+    }
+
+    // No match — create a new canonical entity. Persist embedding as a plain
+    // array so it survives JSON.stringify; rehydrated to Float32Array on use.
+    const id = `ent_${Date.now()}_${this.user.entities.length}`;
+    const record = {
+      id,
+      canonical: text,
+      aliases: [],
+      ...(embedding && embedding.length > 0 ? { embedding: Array.from(embedding) } : {}),
+    };
+    this.user.entities.push(record);
+    return { id, canonical: text, matched_via: 'created' };
+  }
+
+  /**
+   * Manually register that `alias` refers to the same entity as `canonical`.
+   * Creates the canonical entity on the fly if it doesn't yet exist. Useful
+   * when the consumer has prior knowledge that the automatic tiers would miss
+   * (e.g. project code-names, personal nicknames).
+   *
+   * @param {string} canonical
+   * @param {string} alias
+   * @returns {string} the entity id
+   */
+  registerEntityAlias(canonical, alias) {
+    if (!Array.isArray(this.user.entities)) this.user.entities = [];
+    const normCanonical = this.#normalizeLabel(canonical);
+    let ent = this.user.entities.find(e => this.#normalizeLabel(e.canonical) === normCanonical);
+    if (!ent) {
+      ent = { id: `ent_${Date.now()}_${this.user.entities.length}`, canonical, aliases: [] };
+      this.user.entities.push(ent);
+    }
+    const normAlias = this.#normalizeLabel(alias);
+    if (!ent.aliases.some(a => this.#normalizeLabel(a) === normAlias)) {
+      ent.aliases.push(alias);
+    }
+    return ent.id;
+  }
+
+  /**
+   * Look up an entity by id.
+   * @param {string} id
+   * @returns {Object|null}
+   */
+  getEntity(id) {
+    return (this.user.entities || []).find(e => e.id === id) || null;
+  }
+
+  #normalizeLabel(s) {
+    return String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  }
+
+  /**
+   * True if `short` is a plausible acronym of `long`. Matches the uppercase
+   * letters of `short` against the first letter of each significant word in
+   * `long` (skipping short stopwords like 'of', 'the', 'and'). Case-sensitive
+   * on `short` to avoid matching lowercase coincidences like "bsb" against
+   * "blue sandy beach".
+   */
+  #isAcronymMatch(short, long) {
+    if (!short || !long) return false;
+    const clean = short.replace(/[^A-Za-z]/g, '');
+    if (clean.length < 2 || clean.length > 6) return false;
+    if (clean !== clean.toUpperCase()) return false; // must be all-caps to count as acronym
+    const words = long.split(/\s+/).filter(w => w.length > 0 && !_STOPWORDS.has(w.toLowerCase()));
+    if (words.length < clean.length) return false;
+    const firstLetters = words.slice(0, clean.length).map(w => w[0].toUpperCase()).join('');
+    return firstLetters === clean;
   }
 
   /**
@@ -383,16 +1266,14 @@ export class KnowledgeGraph {
 
   /**
    * Return all identities that are currently active.
+   * Adds `effective_strength` (derived from `salience`) and `age_days`.
+   *
    * @param {string} [asOf] - ISO date; defaults to now
-   * @returns {Array} Active identities
+   * @param {Object} [opts]
+   * @returns {Array} Active identities with computed freshness fields
    */
-  getActiveIdentities(asOf) {
-    const ts = asOf ? new Date(asOf).getTime() : Date.now();
-    return this.user.identities.filter(i => {
-      const from = i.valid_from ? new Date(i.valid_from).getTime() : 0;
-      const to = i.valid_to ? new Date(i.valid_to).getTime() : Infinity;
-      return from <= ts && ts < to;
-    });
+  getActiveIdentities(asOf, opts = {}) {
+    return this.#filterActive(this.user.identities, asOf, opts);
   }
 
   /**
@@ -766,11 +1647,15 @@ export class KnowledgeGraph {
       history: [],
       source_trust: {},
       // Layer 1: Typed Memory Nodes
-      beliefs: [],        // Core beliefs: { topic, claim, strength (0-1), evidence_count }
-      preferences: [],    // Explicit preferences: { type, description, strength (0-1) }
-      identities: [],     // Identity attributes: { role, context, salience (0-1) }
+      beliefs: [],        // Core beliefs: { topic, claim, strength (0-1), evidence_count, evidence: [episode_id] }
+      preferences: [],    // Explicit preferences: { type, description, strength (0-1), evidence: [episode_id] }
+      identities: [],     // Identity attributes: { role, context, salience (0-1), evidence: [episode_id] }
       confidence: {},     // Confidence by domain: { domain: confidence_score (0-1) }
-      clones: []          // UserClone hypothesis array
+      clones: [],         // UserClone hypothesis array
+      episodes: [],       // Source records: { id, source, source_date, ingested_at, content_hash, content_summary?, metadata? }
+      entities: [],       // Canonical entities: { id, canonical, aliases: [], embedding? } — collapses "BSB" ↔ "British School Barcelona"
+      insights: [],       // L1.5 insight-swarm output: { insight, question, confidence, supporting_facts, lens, agent, source_layer, l2_seed, ... }
+      syntheses: []       // L2 trait-synthesis output: { id, label, origin, trait, mechanics, reinforcing_nodes, contradicting_nodes, domains_bridged, confidence, confidence_components, affinities, aversions, predictions, surprising, ... }
     };
   }
 
@@ -802,11 +1687,30 @@ export class KnowledgeGraph {
    * Each gap becomes one or more clones with concrete kgOverrides representing
    * a specific hypothesis about how that gap resolves.
    *
+   * Two prompt paths:
+   *   - Cold start (no gaps yet): asks for a small number of short archetypes
+   *     derived from known interests/preferences, with a tight token budget.
+   *     This is the very first `learn()` call on a user — trying to reason
+   *     about "unknown gaps" from near-empty data makes LLMs ramble or emit
+   *     prose; the short-form prompt keeps them on-task.
+   *   - Warm path (gaps present): full archetype prompt, generous budget.
+   *
    * @param {Object} llm - LLM client from llm-provider.js
    * @param {string} model
+   * @param {Object} [opts]
+   * @param {number} [opts.maxTokens=8192] - LLM max_tokens. Default is 8192
+   *   because the prompt asks for nested JSON (arrays of beliefs/preferences/
+   *   identities) and any meaningful archetype easily exceeds 4096 tokens
+   *   mid-structure on typical providers. Lower only if your provider caps
+   *   below 8192.
+   * @param {number} [opts.coldStartMaxTokens=1500] - Tighter budget for the
+   *   cold-start branch where the prompt explicitly requests brevity.
    * @returns {Promise<import('./types.js').UserClone[]>}
    */
-  async seedClones(llm, model) {
+  async seedClones(llm, model, opts = {}) {
+    const maxTokens = opts.maxTokens ?? 8192;
+    const coldStartMaxTokens = opts.coldStartMaxTokens ?? 1500;
+
     // Read gaps stored by CuriosityLoop (beliefs with key starting with gap:)
     const gapBeliefs = (this.user.beliefs || []).filter(b => b.topic?.startsWith('gap:'));
     const gaps = gapBeliefs.map(b => b.claim ?? b.value ?? b.topic.replace('gap:', ''));
@@ -818,13 +1722,35 @@ export class KnowledgeGraph {
       interests: this.user.interests?.slice(0, 5),
     };
 
-    const prompt = `You are building an archetype model of a user.
+    const isColdStart = gaps.length === 0;
+    const prompt = isColdStart
+      ? `You are building an archetype model of a user from sparse initial data.
+
+Known facts about the user:
+${JSON.stringify(known, null, 2)}
+
+Produce exactly 2 short archetype hypotheses that represent meaningfully different plausible versions of this user based on the known data. Keep it compact — no more than 3 beliefs, 3 preferences, and 2 identities per archetype. Keep the total response under ${Math.floor(coldStartMaxTokens * 0.6)} tokens.
+
+Return a JSON array. Each element:
+{
+  "gap": "<one-line open question about this user>",
+  "hypothesis": "<short description of this user variant>",
+  "kgOverrides": {
+    "beliefs": [{ "topic": "...", "value": "...", "confidence": 0.7 }],
+    "preferences": [{ "category": "...", "value": "...", "strength": 0.7 }],
+    "identities": [{ "role": "...", "value": "...", "salience": 0.7 }]
+  },
+  "confidence": 0.5
+}
+
+Return ONLY the JSON array. No prose, no explanation.`
+      : `You are building an archetype model of a user.
 
 Known facts about the user:
 ${JSON.stringify(known, null, 2)}
 
 Unresolved knowledge gaps:
-${gaps.length ? gaps.map((g, i) => `${i + 1}. ${g}`).join('\n') : '(none provided — infer gaps from the known data)'}
+${gaps.map((g, i) => `${i + 1}. ${g}`).join('\n')}
 
 For each gap, create 1–2 concrete archetype hypotheses that represent meaningfully different versions of this user. Each hypothesis must include specific kgOverrides — concrete beliefs, preferences, and identities this version of the user would hold.
 
@@ -844,21 +1770,31 @@ Return ONLY the JSON array. No explanation.`;
 
     const resp = await llm.messages.create({
       model,
-      max_tokens: 1200,
+      max_tokens: isColdStart ? coldStartMaxTokens : maxTokens,
       messages: [{ role: 'user', content: prompt }],
     });
-    const text = resp.content[0].text;
-    const raw = JSON.parse(text.match(/\[[\s\S]*\]/)[0]);
+    const text = resp?.content?.[0]?.text;
+    const raw = _extractJSON(text, 'array');
+    if (!raw || !Array.isArray(raw)) {
+      const err = new Error(
+        '[kg.seedClones] LLM response did not contain a parseable JSON array. ' +
+        'Check LLM output length/truncation or provider health.'
+      );
+      err.stage = 'seedClones';
+      err.code = 'LLM_UNPARSEABLE';
+      console.warn(err.message + ' — skipping seed.');
+      // Attach the failure to the KG so `learn()` can surface it without
+      // changing the array-return contract of this method.
+      this._lastSeedCloneError = err;
+      return [];
+    }
+    this._lastSeedCloneError = null;
     const now = Date.now();
     return raw.map((h, i) => ({
       id: `clone_seed_${now}_${i}`,
       gap: h.gap || '',
       hypothesis: h.hypothesis,
-      kgOverrides: {
-        beliefs: h.kgOverrides?.beliefs || [],
-        preferences: h.kgOverrides?.preferences || [],
-        identities: h.kgOverrides?.identities || [],
-      },
+      kgOverrides: _normalizeKgOverrides(h.kgOverrides),
       confidence: h.confidence ?? 0.5,
       evaluations: [],
       spawnedFrom: null,
@@ -887,12 +1823,28 @@ Return ONLY the JSON array. No explanation.`;
     }
   }
 
-  async breedStrongClones(llm, model) {
+  /**
+   * Breed a neighbouring archetype from every strong clone (confidence > 0.75).
+   *
+   * @param {Object} llm - LLM client from llm-provider.js
+   * @param {string} model
+   * @param {Object} [opts]
+   * @param {number} [opts.maxTokens=8192] - LLM max_tokens per breed call.
+   *   Tighter limits truncate the nested kgOverrides JSON.
+   * @returns {Promise<{ bred: number, failures: Error[] }>} Per-call diagnostics —
+   *   callers that want to surface degraded runs (e.g. `learn()`) can inspect
+   *   `failures` instead of relying on stderr warnings.
+   */
+  async breedStrongClones(llm, model, opts = {}) {
+    const maxTokens = opts.maxTokens ?? 8192;
+    const failures = [];
+    let bred = 0;
+
     const strong = this.getActiveClones().filter(c => c.confidence > 0.75);
     for (const parent of strong) {
       const resp = await llm.messages.create({
         model,
-        max_tokens: 600,
+        max_tokens: maxTokens,
         messages: [{
           role: 'user',
           content: `A user archetype hypothesis has proven strong (confidence > 0.75):
@@ -918,16 +1870,24 @@ Return JSON:
 Return ONLY the JSON object.`,
         }],
       });
-      const raw = JSON.parse(resp.content[0].text.match(/\{[\s\S]*\}/)[0]);
+      const raw = _extractJSON(resp?.content?.[0]?.text, 'object');
+      if (!raw || typeof raw !== 'object') {
+        const err = new Error(
+          `[kg.breedStrongClones] LLM response for parent "${parent.id}" did not contain ` +
+          'parseable JSON object — skipping this parent. Check for truncation or prose wrapping.'
+        );
+        err.stage = 'breedStrongClones';
+        err.code = 'LLM_UNPARSEABLE';
+        err.parentId = parent.id;
+        console.warn(err.message);
+        failures.push(err);
+        continue;
+      }
       this.saveClone({
         id: `clone_bred_${Date.now()}`,
         gap: raw.gap || parent.gap || '',
         hypothesis: raw.hypothesis,
-        kgOverrides: {
-          beliefs: raw.kgOverrides?.beliefs || [],
-          preferences: raw.kgOverrides?.preferences || [],
-          identities: raw.kgOverrides?.identities || [],
-        },
+        kgOverrides: _normalizeKgOverrides(raw.kgOverrides),
         confidence: raw.confidence ?? 0.5,
         evaluations: [],
         spawnedFrom: parent.id,
@@ -936,6 +1896,123 @@ Return ONLY the JSON object.`,
         lastScoredAt: Date.now(),
         status: 'active',
       });
+      bred += 1;
     }
+    return { bred, failures };
+  }
+
+  // ── Salience (top-K filter before any pairwise pass) ────────────────────
+
+  /**
+   * Return the top-K most salient nodes across the requested L1 types.
+   * Salience folds strength × recency decay, evidence count, and slot
+   * volatility into a single 0-1 score. Stale one-off facts (valid_to=null
+   * but evidence_count=1 AND age>180d) are discounted via the stale-active
+   * guardrail — prevents old one-off beliefs from dominating.
+   *
+   * Use this INSTEAD of `getMemoryNodesSummary()` as the input to any
+   * pairwise or O(N²) inference pass. Works in constant memory relative
+   * to the output limit.
+   *
+   * @param {Object} [opts]
+   * @param {('belief'|'preference'|'identity')[]} [opts.types]
+   * @param {number}   [opts.limit=100]
+   * @param {string[]} [opts.domains] filter nodes whose `domain` field matches
+   * @param {string}   [opts.asOf]   ISO date for as-of queries
+   * @returns {Array<{node, type, ref, salience, effective_strength, slot_volatility, stale_active}>}
+   */
+  getTopSalient(opts = {}) {
+    return _getTopSalient(this, opts);
+  }
+
+  /**
+   * Diagnostic: salience distribution, stale-active counts, top-10 examples.
+   * Useful for answering "is this KG mostly signal or mostly ingestion noise?"
+   * without running a full inference pass.
+   *
+   * @returns {{ total, staleActive, percentiles, byType, topExamples }}
+   */
+  salienceDistribution(opts = {}) {
+    return _salienceDistribution(this, opts);
+  }
+
+  // ── Syntheses (L2 trait synthesis) ──────────────────────────────────────
+
+  /**
+   * Persist a synthesis record. Assigns a stable id and generated_at if the
+   * caller didn't provide them. Syntheses with matching (origin, dimension,
+   * value) are upserted in place so re-runs of trait synthesis don't
+   * duplicate the same pattern — the newer record wins when its confidence
+   * is higher, otherwise the older one is kept.
+   *
+   * @param {Object} synthesis
+   * @returns {Object} the stored record
+   */
+  addSynthesis(synthesis) {
+    if (!this.user.syntheses) this.user.syntheses = [];
+    const record = { ...synthesis };
+    if (!record.id) {
+      record.id = `synth_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    }
+    if (!record.generated_at) record.generated_at = new Date().toISOString();
+
+    const key = `${record.origin}|${record.trait?.dimension}|${record.trait?.value}`;
+    const idx = this.user.syntheses.findIndex(s =>
+      `${s.origin}|${s.trait?.dimension}|${s.trait?.value}` === key
+    );
+    if (idx !== -1) {
+      const existing = this.user.syntheses[idx];
+      if ((record.confidence ?? 0) >= (existing.confidence ?? 0)) {
+        // Preserve the original id so callers' references stay valid.
+        record.id = existing.id;
+        this.user.syntheses[idx] = record;
+      }
+      return this.user.syntheses[idx];
+    }
+    this.user.syntheses.push(record);
+    return record;
+  }
+
+  /**
+   * Query syntheses with optional filters.
+   *
+   * @param {Object} [opts]
+   * @param {number}   [opts.minConfidence]       - Drop below this.
+   * @param {string}   [opts.origin]              - "single_node" | "trait_replication" | "contradiction" | "emergent_fusion"
+   * @param {boolean}  [opts.surprising]          - Only return records flagged surprising.
+   * @param {Object}   [opts.trait]               - Match trait.dimension / trait.value (both optional).
+   * @param {string[]} [opts.domainsIncludes]     - Match syntheses whose domains_bridged includes ALL of these.
+   * @returns {Object[]}
+   */
+  getSyntheses(opts = {}) {
+    const all = this.user.syntheses || [];
+    return all.filter(s => {
+      if (opts.minConfidence != null && (s.confidence ?? 0) < opts.minConfidence) return false;
+      if (opts.origin && s.origin !== opts.origin) return false;
+      if (opts.surprising === true && !s.surprising) return false;
+      if (opts.trait?.dimension && s.trait?.dimension !== opts.trait.dimension) return false;
+      if (opts.trait?.value && s.trait?.value !== opts.trait.value) return false;
+      if (Array.isArray(opts.domainsIncludes) && opts.domainsIncludes.length > 0) {
+        const have = new Set(s.domains_bridged || []);
+        if (!opts.domainsIncludes.every(d => have.has(d))) return false;
+      }
+      return true;
+    });
+  }
+
+  /**
+   * Return syntheses whose provenance mentions the given node ref
+   * (reinforcing or contradicting side). Useful for "what patterns does
+   * this fact support or undermine?" queries.
+   *
+   * @param {string} nodeRef - e.g. "belief:running", "preference:pace"
+   * @returns {Object[]}
+   */
+  getSynthesesForNode(nodeRef) {
+    const all = this.user.syntheses || [];
+    return all.filter(s =>
+      (s.reinforcing_nodes || []).includes(nodeRef) ||
+      (s.contradicting_nodes || []).includes(nodeRef)
+    );
   }
 }
