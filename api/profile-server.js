@@ -31,6 +31,8 @@ import { handleChat } from './chat.js';
 import { buildUiHtml } from './ui.js';
 import { mountOnboarding } from './onboarding-server.js';
 import { mountEnrichment } from './enrichment-server.js';
+import { mountProfiling } from './profiling-server.js';
+import { generateQuestions, shouldGenerate } from '../core/profiling/questions.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -72,17 +74,34 @@ function buildLlm() {
   };
 }
 
+const llmFn = buildLlm();
+
 const marble = new Marble({
   storage: KG_FILE,
-  llm: buildLlm(),
+  llm: llmFn,
   mode: 'score',
   count: 10,
 });
 
+// Run profiling question generation if due (weekly cadence).
+async function maybeGenerateProfilingQuestions() {
+  if (!llmFn || !marble.kg) return;
+  if (!shouldGenerate(marble.kg)) return;
+  try {
+    const result = await generateQuestions(marble.kg, llmFn);
+    if (result.generated > 0) {
+      await marble.kg.save();
+      console.log(`[profiling] generated ${result.generated} questions`);
+    }
+  } catch (err) {
+    console.error('[profiling] generation error:', err.message);
+  }
+}
+
 // Initialize eagerly so /healthz is only green once the KG is loaded
 let ready = false;
 let initError = null;
-marble.init().then(() => {
+marble.init().then(async () => {
   ready = true;
 
   // Ensure suggestions array exists without modifying kg.js
@@ -107,6 +126,13 @@ marble.init().then(() => {
     },
   });
 
+  // Mount profiling API
+  mountProfiling(app, { marble, llmFn });
+
+  // Generate profiling questions on startup if due, then check hourly
+  await maybeGenerateProfilingQuestions();
+  setInterval(maybeGenerateProfilingQuestions, 60 * 60 * 1000);
+
   console.log(`[profile-server] marble initialized (kg=${KG_FILE})`);
 }).catch((err) => {
   initError = err;
@@ -114,7 +140,7 @@ marble.init().then(() => {
 });
 
 const app = express();
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '10mb' }));
 
 // ── Onboarding wizard (static files + API routes) ─────────────────────────────
 // Serve CSS/JS from web/onboarding/ at /onboarding/
@@ -360,6 +386,7 @@ app.get('/user-profile/graph/nodes', (_req, res) => {
     const user = kg.user;
     const nodes = [];
     const edges = [];
+    const seenIds = new Set();
 
     const wikidataLabels = kg.user.wikidataLabels ?? {};
     const resolveLabel = topic => {
@@ -368,12 +395,25 @@ app.get('/user-profile/graph/nodes', (_req, res) => {
       return wikidataLabels[qid]?.label ?? topic;
     };
 
+    // Sanitise a raw string into a safe node ID, then make it unique.
+    const safeId = raw => raw.replace(/[^A-Za-z0-9_:-]/g, '_');
+    const uniqueId = base => {
+      let id = safeId(base);
+      if (!seenIds.has(id)) { seenIds.add(id); return id; }
+      let n = 2;
+      while (seenIds.has(`${id}_${n}`)) n++;
+      const unique = `${id}_${n}`;
+      seenIds.add(unique);
+      return unique;
+    };
+
     // Central user node
     nodes.push({ id: 'user', label: 'User', group: 'user', title: 'Central node' });
+    seenIds.add('user');
 
     // Interests
     for (const interest of user.interests ?? []) {
-      const id = `interest-${interest.topic}`;
+      const id = uniqueId(`interest-${interest.topic}`);
       const pct = Math.round((interest.weight ?? 0) * 100);
       const humanLabel = resolveLabel(interest.topic);
       const isWikidata = interest.topic.startsWith('wikidata:');
@@ -393,7 +433,7 @@ app.get('/user-profile/graph/nodes', (_req, res) => {
 
     // Beliefs (active only)
     for (const belief of kg.getActiveBeliefs()) {
-      const id = `belief-${belief.topic}`;
+      const id = uniqueId(`belief-${belief.topic}`);
       nodes.push({
         id,
         label: belief.topic,
@@ -406,7 +446,7 @@ app.get('/user-profile/graph/nodes', (_req, res) => {
 
     // Identities (active only)
     for (const identity of kg.getActiveIdentities()) {
-      const id = `identity-${identity.role}`;
+      const id = uniqueId(`identity-${identity.role}`);
       nodes.push({
         id,
         label: identity.role,
@@ -419,7 +459,7 @@ app.get('/user-profile/graph/nodes', (_req, res) => {
 
     // Preferences (active only)
     for (const pref of kg.getActivePreferences()) {
-      const id = `pref-${pref.type}-${pref.description}`.replace(/\s+/g, '_').slice(0, 60);
+      const id = uniqueId(`pref-${pref.type}-${pref.description}`);
       nodes.push({
         id,
         label: `${pref.type}\n${pref.description.slice(0, 20)}`,

@@ -148,7 +148,12 @@ export function buildUiHtml(audienceId, kgFile) {
         </div>
 
         <!-- Review content area (scrollable) -->
-        <div id="review-content" class="flex-1 overflow-y-auto px-4 py-4 space-y-4"></div>
+        <div id="review-content" class="flex-1 overflow-y-auto px-4 py-4 space-y-4">
+          <!-- Profiling questions section (prepended dynamically) -->
+          <div id="profiling-section"></div>
+          <!-- Enrichment suggestions section -->
+          <div id="enrichment-section"></div>
+        </div>
       </div>
 
       <!-- Query tab -->
@@ -228,6 +233,7 @@ export function buildUiHtml(audienceId, kgFile) {
       network.fit();
     }
     if (tab === 'review') {
+      loadProfilingQuestions();
       loadPending();
     }
   }
@@ -407,27 +413,32 @@ export function buildUiHtml(audienceId, kgFile) {
 
     wrapper.appendChild(bubble);
 
-    // Tool call apply buttons
+    // Auto-apply tool calls and show a status badge inside the bubble
     if (toolCalls && toolCalls.length > 0) {
-      const toolWrapper = document.createElement('div');
-      toolWrapper.className = 'mt-2 flex flex-col gap-1 max-w-[85%]';
-      toolCalls.forEach((tc, i) => {
-        const btn = document.createElement('button');
-        btn.className = 'text-left text-xs bg-indigo-900/60 border border-indigo-700/60 hover:bg-indigo-800/60 text-indigo-300 rounded-lg px-2 py-1.5 transition-colors';
-        const preview = tc.action === 'facts'
-          ? 'Apply: ' + JSON.stringify(tc.data).slice(0, 60) + (JSON.stringify(tc.data).length > 60 ? '…' : '')
-          : 'Apply reaction: ' + (tc.data?.reaction || '?');
-        btn.textContent = preview;
-        btn.onclick = () => applyToolCall(tc, btn);
-        toolWrapper.appendChild(btn);
+      const statusEl = document.createElement('span');
+      statusEl.className = 'text-xs text-indigo-400 mt-1 block';
+      statusEl.textContent = '↻ Updating graph…';
+      bubble.appendChild(statusEl);
+
+      Promise.all(toolCalls.map(tc => {
+        const endpoint = tc.action === 'facts'
+          ? '/user-profile/profile/facts'
+          : tc.action === 'profiling'
+          ? '/user-profile/profiling/answer'
+          : '/user-profile/profile/decisions';
+        return fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(tc.data),
+        }).then(r => r.ok ? r : Promise.reject('HTTP ' + r.status));
+      })).then(() => {
+        statusEl.textContent = '✓ Graph updated';
+        statusEl.className = 'text-xs text-emerald-400 mt-1 block';
+        loadGraph();
+      }).catch(() => {
+        statusEl.textContent = '⚠ Update failed';
+        statusEl.className = 'text-xs text-rose-400 mt-1 block';
       });
-      const outerWrap = document.createElement('div');
-      outerWrap.className = isUser ? 'flex justify-end' : 'flex justify-start';
-      outerWrap.appendChild(toolWrapper);
-      container.appendChild(wrapper);
-      container.appendChild(outerWrap);
-      container.scrollTop = container.scrollHeight;
-      return;
     }
 
     container.appendChild(wrapper);
@@ -539,31 +550,158 @@ export function buildUiHtml(audienceId, kgFile) {
   }
 
   async function loadPending() {
-    const content = document.getElementById('review-content');
+    const section = document.getElementById('enrichment-section');
     const statusEl = document.getElementById('enrichment-status');
-    content.innerHTML = '<div class="text-slate-500 text-sm">Loading…</div>';
+    section.innerHTML = '<div class="text-slate-500 text-sm">Loading…</div>';
 
     try {
       const res = await fetch('/user-profile/enrichment/pending');
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const { categories } = await res.json();
 
-      // Count total pending
       const total = categories.reduce((sum, cat) => sum + cat.items.length, 0);
       updateReviewBadge(total);
       statusEl.textContent = total + ' item' + (total !== 1 ? 's' : '') + ' pending review';
 
+      section.innerHTML = '';
       if (total === 0) {
-        content.innerHTML = '<div class="text-slate-500 text-sm py-4">No pending items — run enrichment to generate suggestions.</div>';
+        section.innerHTML = '<div class="text-slate-500 text-sm py-4">No pending enrichment items — run enrichment to generate suggestions.</div>';
         return;
       }
 
-      content.innerHTML = '';
       for (const cat of categories) {
-        content.appendChild(buildCategorySection(cat));
+        section.appendChild(buildCategorySection(cat));
       }
     } catch (err) {
-      content.innerHTML = '<div class="text-red-400 text-sm">' + escHtml('Error loading pending: ' + err.message) + '</div>';
+      section.innerHTML = '<div class="text-red-400 text-sm">' + escHtml('Error loading pending: ' + err.message) + '</div>';
+    }
+  }
+
+  // ── Profiling Q&A ─────────────────────────────────────────────────────────
+
+  async function loadProfilingQuestions() {
+    const section = document.getElementById('profiling-section');
+    try {
+      const res = await fetch('/user-profile/profiling/pending');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const { questions, shouldGenerate: canGenerate, stats } = await res.json();
+
+      section.innerHTML = '';
+
+      if (questions.length === 0 && !canGenerate) return; // nothing to show
+
+      const card = document.createElement('div');
+      card.className = 'bg-slate-800 rounded-xl border border-indigo-700/40 overflow-hidden mb-4';
+
+      // Header
+      const hdr = document.createElement('div');
+      hdr.className = 'flex items-center justify-between px-4 py-3 border-b border-slate-700';
+      hdr.style.background = '#1a1f3a';
+      hdr.innerHTML =
+        '<div class="flex items-center gap-2">' +
+          '<span class="text-indigo-400 text-sm font-semibold">Profile Questions</span>' +
+          (questions.length > 0 ? '<span class="bg-indigo-600 text-white text-xs font-bold px-1.5 py-0.5 rounded-full">' + questions.length + '</span>' : '') +
+        '</div>' +
+        (canGenerate
+          ? '<button id="profiling-gen-btn" onclick="generateProfilingQuestions()" class="text-xs bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1 rounded transition-colors">Generate Questions</button>'
+          : '<span class="text-xs text-slate-500">Next batch in ~7 days</span>');
+
+      card.appendChild(hdr);
+
+      if (questions.length === 0 && canGenerate) {
+        const empty = document.createElement('div');
+        empty.className = 'px-4 py-3 text-slate-400 text-sm';
+        empty.textContent = 'No pending questions. Click "Generate Questions" to create a new batch.';
+        card.appendChild(empty);
+      }
+
+      for (const q of questions) {
+        card.appendChild(buildQuestionRow(q));
+      }
+
+      section.appendChild(card);
+    } catch (err) {
+      section.innerHTML = '<div class="text-red-400 text-sm px-1">' + escHtml('Error loading questions: ' + err.message) + '</div>';
+    }
+  }
+
+  function buildQuestionRow(q) {
+    const row = document.createElement('div');
+    row.id = 'pq-row-' + q.id;
+    row.className = 'px-4 py-3 border-b border-slate-700/50 last:border-0';
+
+    const inputId = 'pq-input-' + q.id;
+    row.innerHTML =
+      '<div class="text-sm text-slate-200 mb-2">' + escHtml(q.question) + '</div>' +
+      '<div class="flex gap-2">' +
+        '<input id="' + inputId + '" type="text" placeholder="Your answer…"' +
+          ' class="flex-1 bg-slate-700 border border-slate-600 rounded-lg px-3 py-1.5 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-indigo-500" />' +
+        '<button onclick=\\'submitProfilingAnswer(' + JSON.stringify(q.id) + ')\\' class="text-xs bg-emerald-700 hover:bg-emerald-600 text-white px-3 py-1.5 rounded-lg transition-colors">Answer</button>' +
+        '<button onclick=\\'dismissProfilingQuestion(' + JSON.stringify(q.id) + ')\\' class="text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 px-2 py-1.5 rounded-lg transition-colors">Skip</button>' +
+      '</div>';
+
+    // Allow Enter to submit
+    setTimeout(() => {
+      const input = document.getElementById(inputId);
+      if (input) input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') submitProfilingAnswer(q.id);
+      });
+    }, 0);
+
+    return row;
+  }
+
+  async function submitProfilingAnswer(id) {
+    const input = document.getElementById('pq-input-' + id);
+    if (!input) return;
+    const answer = input.value.trim();
+    if (!answer) return;
+
+    input.disabled = true;
+    try {
+      const res = await fetch('/user-profile/profiling/answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, answer }),
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const row = document.getElementById('pq-row-' + id);
+      if (row) {
+        row.innerHTML = '<div class="flex items-center gap-2 py-1">' +
+          '<span class="text-emerald-400 text-xs">✓ Answered</span>' +
+          '<span class="text-slate-400 text-xs">' + escHtml(answer) + '</span>' +
+          '</div>';
+      }
+      loadGraph();
+    } catch (err) {
+      input.disabled = false;
+      input.placeholder = 'Error: ' + err.message;
+    }
+  }
+
+  async function dismissProfilingQuestion(id) {
+    try {
+      await fetch('/user-profile/profiling/dismiss', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id }),
+      });
+      const row = document.getElementById('pq-row-' + id);
+      if (row) row.remove();
+    } catch {}
+  }
+
+  async function generateProfilingQuestions() {
+    const btn = document.getElementById('profiling-gen-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Generating…'; }
+    try {
+      const res = await fetch('/user-profile/profiling/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'HTTP ' + res.status);
+      await loadProfilingQuestions();
+    } catch (err) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Generate Questions'; }
+      alert('Error: ' + err.message);
     }
   }
 
@@ -583,7 +721,7 @@ export function buildUiHtml(audienceId, kgFile) {
       '</div>' +
       '<div class="flex items-center gap-2">' +
         '<span id="cat-count-' + escHtml(cat.id) + '" class="text-xs text-slate-400">' + cat.items.length + ' items</span>' +
-        '<button class="text-xs bg-emerald-700 hover:bg-emerald-600 text-white px-2 py-1 rounded transition-colors" onclick="approveAll(' + JSON.stringify(cat.id) + ')">Approve All</button>' +
+        '<button class="text-xs bg-emerald-700 hover:bg-emerald-600 text-white px-2 py-1 rounded transition-colors" onclick=\\'approveAll(' + JSON.stringify(cat.id) + ')\\'>Approve All</button>' +
         '<span class="text-slate-500 text-xs collapse-toggle">▼</span>' +
       '</div>';
 
@@ -625,8 +763,8 @@ export function buildUiHtml(audienceId, kgFile) {
         (tags ? '<div class="flex flex-wrap gap-1 mt-1.5">' + tags + '</div>' : '') +
       '</div>' +
       '<div class="flex gap-1.5 shrink-0 mt-0.5">' +
-        '<button class="text-xs bg-emerald-700 hover:bg-emerald-600 text-white px-2.5 py-1 rounded transition-colors" onclick="decideItem(' + JSON.stringify(item.id) + ', ' + JSON.stringify(item.category) + ', \\'approve\\')">✓ Approve</button>' +
-        '<button class="text-xs bg-rose-800 hover:bg-rose-700 text-white px-2.5 py-1 rounded transition-colors" onclick="decideItem(' + JSON.stringify(item.id) + ', ' + JSON.stringify(item.category) + ', \\'reject\\')">✗ Reject</button>' +
+        '<button class="text-xs bg-emerald-700 hover:bg-emerald-600 text-white px-2.5 py-1 rounded transition-colors" onclick=\\'decideItem(' + JSON.stringify(item.id) + ', ' + JSON.stringify(item.category) + ', "approve")\\'>✓ Approve</button>' +
+        '<button class="text-xs bg-rose-800 hover:bg-rose-700 text-white px-2.5 py-1 rounded transition-colors" onclick=\\'decideItem(' + JSON.stringify(item.id) + ', ' + JSON.stringify(item.category) + ', "reject")\\'>✗ Reject</button>' +
       '</div>';
 
     return row;
@@ -655,10 +793,10 @@ export function buildUiHtml(audienceId, kgFile) {
     const newCount = Math.max(0, pendingCount - 1);
     statusEl.textContent = newCount + ' item' + (newCount !== 1 ? 's' : '') + ' pending review';
 
-    // If no categories left, show empty state
-    const content = document.getElementById('review-content');
-    if (content && content.querySelectorAll('[id^="cat-section-"]').length === 0) {
-      content.innerHTML = '<div class="text-slate-500 text-sm py-4">No pending items — run enrichment to generate suggestions.</div>';
+    // If no enrichment categories left, show empty state
+    const enrichSection = document.getElementById('enrichment-section');
+    if (enrichSection && enrichSection.querySelectorAll('[id^="cat-section-"]').length === 0) {
+      enrichSection.innerHTML = '<div class="text-slate-500 text-sm py-4">No pending enrichment items — run enrichment to generate suggestions.</div>';
     }
   }
 
@@ -753,16 +891,21 @@ export function buildUiHtml(audienceId, kgFile) {
 
   // ── Init ──────────────────────────────────────────────────────────────────
   loadGraph();
-  // Pre-fetch pending count for badge without rendering full panel
-  fetch('/user-profile/enrichment/pending')
-    .then(r => r.json())
-    .then(({ categories }) => {
-      const total = (categories ?? []).reduce((sum, cat) => sum + (cat.items?.length ?? 0), 0);
-      updateReviewBadge(total);
-      const statusEl = document.getElementById('enrichment-status');
-      if (statusEl) statusEl.textContent = total + ' item' + (total !== 1 ? 's' : '') + ' pending review';
-    })
-    .catch(() => { /* badge stays hidden */ });
+  // Pre-fetch pending counts for badge without rendering full panel
+  Promise.all([
+    fetch('/user-profile/enrichment/pending').then(r => r.json()).catch(() => ({ categories: [] })),
+    fetch('/user-profile/profiling/pending').then(r => r.json()).catch(() => ({ questions: [] })),
+  ]).then(([enrichData, profilingData]) => {
+    const enrichTotal = (enrichData.categories ?? []).reduce((sum, cat) => sum + (cat.items?.length ?? 0), 0);
+    const profilingTotal = (profilingData.questions ?? []).length;
+    const total = enrichTotal + profilingTotal;
+    updateReviewBadge(total);
+    const statusEl = document.getElementById('enrichment-status');
+    const parts = [];
+    if (enrichTotal > 0) parts.push(enrichTotal + ' enrichment');
+    if (profilingTotal > 0) parts.push(profilingTotal + ' profile question' + (profilingTotal !== 1 ? 's' : ''));
+    if (statusEl && parts.length > 0) statusEl.textContent = parts.join(', ') + ' pending';
+  });
   </script>
 </body>
 </html>`;

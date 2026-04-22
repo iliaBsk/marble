@@ -5,6 +5,8 @@
  * both the cleaned prose reply and any parsed tool-call blocks.
  */
 
+import { getPendingQuestions } from '../core/profiling/questions.js';
+
 const TOOL_BLOCK_RE = /<tool>([\s\S]*?)<\/tool>/g;
 
 /**
@@ -44,6 +46,12 @@ function buildSystemPrompt(kg) {
     ctx.mood_signal ? `  mood_signal: ${ctx.mood_signal}` : null,
   ].filter(Boolean).join('\n') || '  (none)';
 
+  const pendingQuestions = getPendingQuestions(kg);
+  const pendingQuestionsSection = pendingQuestions.length > 0
+    ? `\n\n## Pending Profile Questions (${pendingQuestions.length})\n` +
+      pendingQuestions.map((q, i) => `${i + 1}. [ID: ${q.id}] ${q.question}`).join('\n')
+    : '';
+
   return `You are a Marble Profile Assistant — an AI agent that helps explore and update a user's personalization knowledge graph (KG).
 
 ## Current KG State
@@ -61,23 +69,28 @@ ${activePrefs}
 ${activeIds}
 
 ### Context
-${ctxLines}
+${ctxLines}${pendingQuestionsSection}
 
 ## Your Capabilities
 
 You can suggest profile updates by including JSON tool blocks in your response.
 
-To add interests, identities, or apply a reaction:
-<tool>{"action":"facts","data":{"interests":["tennis"],"identities":[{"role":"father","context":"8yo boy","salience":0.9}]}}</tool>
+To add interests, beliefs, identities, or preferences:
+<tool>{"action":"facts","data":{"interests":["tennis"],"beliefs":[{"topic":"marital_status","claim":"married","strength":0.9}],"identities":[{"role":"parent","context":"2 kids","salience":0.9}]}}</tool>
 
 To record a content reaction (up/down/skip/share):
 <tool>{"action":"decisions","data":{"item":{"id":"item-1","topics":["tennis"],"source":"chat"},"reaction":"up"}}</tool>
 
-Rules:
-- Include tool blocks only when the user explicitly asks to update the profile or when it is clearly beneficial.
-- After a tool block, continue with normal prose (the block is invisible to the user — they see only your prose reply and an "Apply" button).
+To answer one or more pending profile questions (include kgUpdates to write to the KG):
+<tool>{"action":"profiling","data":{"answers":[{"id":"pq_marital_status","answer":"married","kgUpdates":{"beliefs":[{"topic":"marital_status","claim":"married","strength":0.9}]}}]}}</tool>
+
+## Rules
+- Include tool blocks when the user asks to update the profile or answers a profile question.
+- A single response may contain multiple tool blocks.
+- Tool blocks are invisible to the user — they see only your prose reply.
 - Be concise and conversational.
 - When the user asks what is in the profile, summarise the KG state above accurately.
+${pendingQuestions.length > 0 ? `- When the user says "update profile", "answer questions", or similar, present the pending profile questions listed above and process their answers via profiling tool blocks. You may answer multiple questions from a single user response.` : ''}
 `;
 }
 
